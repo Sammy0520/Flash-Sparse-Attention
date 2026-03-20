@@ -6,6 +6,7 @@ from flash_attn import flash_attn_varlen_func
 from fsa_preview.ops import (_compressed_attention_decode,
                              _linear_compress_decode,
                              _topk_sparse_attention_decode)
+from fsa_preview.ops.compress_attention_mask import compress_attention_mask
 from nsa_ref.module.rope import RopeConfig, RotaryEmbedding
 
 
@@ -110,12 +111,10 @@ class FlashSparseAttentionDecode(torch.nn.Module):
                 assert attention_mask.shape == (total_q_len, total_k_len), (
                     f"attention_mask shape {attention_mask.shape} != (total_q_len, total_k_len) ({total_q_len}, {total_k_len})"
                 )
-                mask_2d = attention_mask
             else:
                 assert attention_mask.shape == (self.num_q_heads, total_q_len, total_k_len), (
                     f"attention_mask shape {attention_mask.shape} != (num_q_heads, total_q_len, total_k_len)"
                 )
-                mask_2d = attention_mask.max(dim=0).values  # (total_q_len, total_k_len)
 
         # compute seqlens after compression
         compressed_seqlens = torch.floor((seqlens_k - self.kernel_size) / self.kernel_stride) + 1
@@ -167,20 +166,8 @@ class FlashSparseAttentionDecode(torch.nn.Module):
 
         # Build compressed_mask from full attention_mask when present (for tree decoding)
         # compressed_mask[q, c] = 1 iff any key in block c is visible to q (1=attend, 0=mask)
-        attention_mask_compressed = None
-        if attention_mask is not None:
-            total_q_len, total_k_len = q.shape[0], k.shape[0]
-            mask_2d = attention_mask if attention_mask.dim() == 2 else attention_mask.max(dim=0).values
-            compressed_k_len = compressed_k.shape[0]
-            # Block c covers uncompress indices [c*kernel_stride, c*kernel_stride+kernel_size)
-            compressed_mask = torch.zeros(
-                total_q_len, compressed_k_len, device=x.device, dtype=torch.float32
-            )
-            for c in range(compressed_k_len):
-                start = c * self.kernel_stride
-                end = min(start + self.kernel_size, mask_2d.shape[1])
-                compressed_mask[:, c] = mask_2d[:, start:end].to(torch.float32).amax(dim=1)
-            attention_mask_compressed = compressed_mask
+        compressed_k_len = compressed_k.shape[0]
+        attention_mask_compressed = compress_attention_mask(attention_mask, compressed_k_len, self.kernel_stride, self.kernel_size)
 
         # do rope for query and compressed key
         if position_ids is not None:
