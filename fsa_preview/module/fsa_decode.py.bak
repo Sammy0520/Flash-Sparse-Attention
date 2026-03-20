@@ -70,25 +70,12 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         v_cache: torch.Tensor = None,
         cmp_k_cache: torch.Tensor = None,
         cmp_v_cache: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        position_ids: torch.Tensor = None,
     ):
-        """
-        Args:
-            attention_mask: Optional mask for q-to-k attention, shape (total_q_len, total_k_len)
-                or (num_q_heads, total_q_len, total_k_len). Used for tree decoding (e.g. EAGLE):
-                caller should pass a mask where tree positions can attend along their path.
-                When provided, it is passed to compressed/topk (kernel support TODO). The sliding branch
-                does not apply it (flash_attn has no custom mask API); for full tree semantics, add mask in compressed/topk kernels.
-            position_ids: Optional absolute positions for current queries/keys, shape (total_q_len,).
-                For linear multi-token decode, typically `arange(past_len, past_len + q_len)`.
-        """
         # dtype and shape check
         assert x.dtype == torch.bfloat16 or x.dtype == torch.float16
         assert x.shape[-1] == self.hidden_size
         cu_seqlens_k = cu_seqlens_k.to(torch.int32)
         seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
 
         # qkv proj
         q = self.proj_q(x).view(-1, self.num_q_heads, self.head_dim)
@@ -96,26 +83,6 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         v_new = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
         k = torch.cat([k_cache, k_new], dim=0)
         v = torch.cat([v_cache, v_new], dim=0)
-
-        if position_ids is not None:
-            # explicit absolute positions for the new queries/keys; only linear (single-batch) supported here
-            assert position_ids.shape[0] == q.shape[0], (
-                f"position_ids length {position_ids.shape[0]} != total_q_len {q.shape[0]}"
-            )
-
-        if attention_mask is not None:
-            total_q_len, total_k_len = q.shape[0], k.shape[0]
-            assert attention_mask.dim() in (2, 3), "attention_mask must be 2D or 3D"
-            if attention_mask.dim() == 2:
-                assert attention_mask.shape == (total_q_len, total_k_len), (
-                    f"attention_mask shape {attention_mask.shape} != (total_q_len, total_k_len) ({total_q_len}, {total_k_len})"
-                )
-                mask_2d = attention_mask
-            else:
-                assert attention_mask.shape == (self.num_q_heads, total_q_len, total_k_len), (
-                    f"attention_mask shape {attention_mask.shape} != (num_q_heads, total_q_len, total_k_len)"
-                )
-                mask_2d = attention_mask.max(dim=0).values  # (total_q_len, total_k_len)
 
         # compute seqlens after compression
         compressed_seqlens = torch.floor((seqlens_k - self.kernel_size) / self.kernel_stride) + 1
@@ -165,29 +132,8 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             compressed_k = cmp_k_cache
             compressed_v = cmp_v_cache
 
-        # Build compressed_mask from full attention_mask when present (for tree decoding)
-        # compressed_mask[q, c] = 1 iff any key in block c is visible to q (1=attend, 0=mask)
-        attention_mask_compressed = None
-        if attention_mask is not None:
-            total_q_len, total_k_len = q.shape[0], k.shape[0]
-            mask_2d = attention_mask if attention_mask.dim() == 2 else attention_mask.max(dim=0).values
-            compressed_k_len = compressed_k.shape[0]
-            # Block c covers uncompress indices [c*kernel_stride, c*kernel_stride+kernel_size)
-            compressed_mask = torch.zeros(
-                total_q_len, compressed_k_len, device=x.device, dtype=torch.float32
-            )
-            for c in range(compressed_k_len):
-                start = c * self.kernel_stride
-                end = min(start + self.kernel_size, mask_2d.shape[1])
-                compressed_mask[:, c] = mask_2d[:, start:end].to(torch.float32).amax(dim=1)
-            attention_mask_compressed = compressed_mask
-
         # do rope for query and compressed key
-        if position_ids is not None:
-            q = self.rope(q, cu_seqlens_q, position_ids=position_ids)
-        else:
-            q = self.rope(q, cu_seqlens_q)
-        # compressed_k uses compressed_cu_seqlens + (start,stride) scheme as before
+        q = self.rope(q, cu_seqlens_q)
         compressed_k = self.rope(compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride)
 
         # attention between query and compressed key value
@@ -202,43 +148,37 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             self.topk,
             cu_seqlens_q,
             compressed_cu_seqlens,
-            max_seqlen_q,
+            1,
             compressed_seqlens.max().item(),
             None,
             self.init_blocks,
             self.local_blocks,
             query_start_index=k_cache.shape[0],
-            attention_mask=attention_mask_compressed,
         )
 
         # do rope for original key
-        if position_ids is not None:
-            # apply RoPE only to new keys with explicit positions, keep cached part as-is
-            new_pos = position_ids
-            k_new_rope = self.rope(k_new, cu_seqlens_q, position_ids=new_pos)
-            k = torch.cat([k_cache, k_new_rope], dim=0)
-        else:
-            k = self.rope(k, cu_seqlens_k)
+        k = self.rope(k, cu_seqlens_k)
 
         # topk sparse attention
         sparse_attn_output = _topk_sparse_attention_decode(
             q, k, v, topk_idx, self.block_size,
+            # cu_seqlen_q and cu_seqlen_k
             cu_seqlens_q,
             cu_seqlens_k,
-            max_seqlen_q,
+            # max_seqlen_q and max_seqlen_k
+            1,
             seqlens_k.max().item(),
-            None,
-            attention_mask=attention_mask,
+            None
         )
 
-        # sliding window attention (flash_attn does not support custom mask; sliding branch never applies attention_mask)
+        # sliding window attention
         sliding_attn_output = flash_attn_varlen_func(
             q,
             k,
             v,
             cu_seqlens_q,
             cu_seqlens_k,
-            max_seqlen_q,
+            1,
             seqlens_k.max().item(),
             causal=False,
             window_size=(self.window_size, -1),

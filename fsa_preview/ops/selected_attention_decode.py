@@ -16,7 +16,9 @@ def _topk_sparse_attention_decode(
     max_seqlen_q: torch.Tensor,
     max_seqlen_k: torch.Tensor,
     sm_scale=None,
+    attention_mask: torch.Tensor = None,
 ):
+    # attention_mask: optional (total_q_len, total_k_len) or (num_heads, total_q_len, total_k_len), 1=attend 0=mask. Applied in kernel.
     # dtype check
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
     assert q.dtype == k.dtype and k.dtype == v.dtype
@@ -25,6 +27,15 @@ def _topk_sparse_attention_decode(
     # softmax scale
     if sm_scale is None:
         sm_scale = 1 / math.sqrt(q.shape[-1])
+
+    mask_2d = None
+    if attention_mask is not None:
+        if attention_mask.dim() == 3:
+            mask_2d = attention_mask.max(dim=0).values
+        else:
+            mask_2d = attention_mask
+        if mask_2d.dtype != torch.float32:
+            mask_2d = mask_2d.to(torch.float32)
 
     o, lse = _topk_sparse_attention_fwd(
         q,
@@ -37,6 +48,7 @@ def _topk_sparse_attention_decode(
         max_seqlen_q,
         max_seqlen_k,
         sm_scale,
+        attention_mask=mask_2d,
     )
 
     return o

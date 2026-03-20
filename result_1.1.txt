@@ -1,0 +1,24 @@
+===========================================================================
+Compressed Attention Decode Kernel Benchmark (isolated)
+===========================================================================
+  seqlen -> compressed_k_len, num_k_blocks (BLOCK_K=128)
+  q_len  -> num_q_blocks (BLOCK_Q=16)
+  KV-reuse (1.2) benefits: num_k_blocks>1 AND num_q_blocks>1
+===========================================================================
+  seqlen=1000 q_len=4  ERROR: 
+  seqlen=1000 q_len=16  ERROR: 
+  seqlen=1000 q_len=32  ERROR: 
+  seqlen=4000 q_len=4  ERROR: 
+  seqlen=4000 q_len=16  ERROR: 
+  seqlen=4000 q_len=32  ERROR: 
+  seqlen=8000 q_len=4  ERROR: 
+  seqlen=8000 q_len=16  ERROR: 
+  seqlen=8000 q_len=32  ERROR: 
+  seqlen=16000 q_len=4  ERROR: 
+  seqlen=16000 q_len=16  ERROR: 
+  seqlen=16000 q_len=32  ERROR: 
+
+===========================================================================
+To compare 1.1 vs 1.2: run this benchmark, then 'git stash' your 1.2
+changes, run again (1.1), then 'git stash pop'. Compare ms above.
+===========================================================================

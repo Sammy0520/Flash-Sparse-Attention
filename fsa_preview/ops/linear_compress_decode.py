@@ -12,7 +12,7 @@ IS_HOPPER_GPU = is_hopper_gpu()
 
 
 def _linear_compress_decode(
-    new_tokens,  # New tokens to append [1, num_heads, head_dim]
+    new_tokens,  # New tokens to append [K, num_heads, head_dim], K >= 1
     compress_weight,  # [num_heads, head_dim * kernel_size, head_dim]
     kernel_size,
     kernel_stride,
@@ -22,8 +22,11 @@ def _linear_compress_decode(
 ):
     """
     Decode version that properly handles absolute positions and windowing.
+    Supports multiple new tokens (K >= 1): computes all new compressed blocks
+    from prev_max_output_idx+1 to new_max_output_idx and returns their concat.
     """
     device = new_tokens.device
+    num_new = new_tokens.shape[0]
 
     # Update token buffer with new tokens
     if token_buffer is None:
@@ -33,38 +36,50 @@ def _linear_compress_decode(
         all_tokens = torch.cat([token_buffer, new_tokens], dim=0)
         buffer_start_pos = prev_total_len - token_buffer.shape[0]
 
-    new_total_len = prev_total_len + 1
+    new_total_len = prev_total_len + num_new
 
-    # Calculate which output positions we had before and what we should have now
-    prev_max_output_idx = math.floor((prev_total_len - kernel_size) / kernel_stride) if prev_total_len >= kernel_size else -1
-    new_max_output_idx = math.floor((new_total_len - kernel_size) / kernel_stride) if new_total_len >= kernel_size else -1
+    # Which compressed output indices exist before vs after this step
+    prev_max_output_idx = (
+        math.floor((prev_total_len - kernel_size) / kernel_stride)
+        if prev_total_len >= kernel_size
+        else -1
+    )
+    new_max_output_idx = (
+        math.floor((new_total_len - kernel_size) / kernel_stride)
+        if new_total_len >= kernel_size
+        else -1
+    )
 
     if new_max_output_idx <= prev_max_output_idx:
         # No new outputs to compute
         return None
 
-    # Determine the input window
+    # Collect every new compressed block's input window (fully inside all_tokens)
     windows_to_compute = []
-    window_start_abs = new_max_output_idx * kernel_stride  # Absolute position in full sequence
-    window_end_abs = window_start_abs + kernel_size
-
-    # Convert to relative position in our buffer
-    window_start_rel = window_start_abs - buffer_start_pos
-    window_end_rel = window_end_abs - buffer_start_pos
-
-    # Check if we have all tokens for this window
-    if window_start_rel >= 0 and window_end_rel <= all_tokens.shape[0]:
-        window_tokens = all_tokens[window_start_rel:window_end_rel]
-        windows_to_compute.append(window_tokens)
+    for out_idx in range(prev_max_output_idx + 1, new_max_output_idx + 1):
+        window_start_abs = out_idx * kernel_stride
+        window_end_abs = window_start_abs + kernel_size
+        window_start_rel = window_start_abs - buffer_start_pos
+        window_end_rel = window_end_abs - buffer_start_pos
+        if window_start_rel >= 0 and window_end_rel <= all_tokens.shape[0]:
+            window_tokens = all_tokens[window_start_rel:window_end_rel]
+            windows_to_compute.append(window_tokens)
 
     if not windows_to_compute:
         return None
-    # Create cu_seqlens for the stacked windows
-    cu_seqlens = torch.tensor([0, kernel_size], dtype=torch.int32, device=device)
-    y_cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    # Compute compressed representation
+
+    num_windows = len(windows_to_compute)
+    # Stack windows: [num_windows * kernel_size, num_heads, head_dim]
+    stacked = torch.cat(windows_to_compute, dim=0)
+    # cu_seqlens: one segment per window, each of length kernel_size
+    cu_seqlens = torch.arange(
+        0, (num_windows + 1) * kernel_size, kernel_size,
+        dtype=torch.int32, device=device,
+    )
+    y_cu_seqlens = torch.arange(0, num_windows + 1, dtype=torch.int32, device=device)
+
     compressed_output = linear_compress_with_pe(
-        window_tokens,
+        stacked,
         compress_weight,
         cu_seqlens,
         kernel_size,

@@ -60,6 +60,7 @@ class FlashSparseAttentionDecodeKernel(torch.nn.Module):
         v_cache: torch.Tensor = None,
         cmp_k_cache: torch.Tensor = None,
         cmp_v_cache: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
     ):
         # dtype and shape check
         assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
@@ -135,18 +136,18 @@ class FlashSparseAttentionDecodeKernel(torch.nn.Module):
             self.init_blocks,
             self.local_blocks,
             query_start_index=k_cache.shape[0],
+            attention_mask=attention_mask,
         )
 
         # topk sparse attention
         sparse_attn_output = _topk_sparse_attention_decode(
             q, k, v, topk_idx, self.block_size,
-            # cu_seqlen_q and cu_seqlen_k
             cu_seqlens_q,
             cu_seqlens_k,
-            # max_seqlen_q and max_seqlen_k
             1,
             seqlens_k.max().item(),
-            None
+            None,
+            attention_mask=attention_mask,
         )
 
         # sliding window attention

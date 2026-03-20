@@ -182,7 +182,7 @@ if __name__ == "__main__":
         )
 
         # Combine results
-        if decode_k_output.shape[0] > 0:
+        if decode_k_output is not None and decode_k_output.shape[0] > 0:
             combined_compressed_k = torch.cat([compressed_k_first, decode_k_output], dim=0)
             combined_compressed_v = torch.cat([compressed_v_first, decode_v_output], dim=0)
         else:
@@ -232,6 +232,79 @@ if __name__ == "__main__":
         )
 
         print(f"  ✅ Test PASSED for decode_size={append_size}")
+
+    # -------------------------------------------------------------------------
+    # Equivalence test: K tokens in one call vs K calls with 1 token each
+    # -------------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("EQUIVALENCE: multi-token vs incremental _linear_compress_decode")
+    print("="*60)
+
+    for K in [1, 4, 32]:
+        if K < 1:
+            continue
+        # prev_total_len: uncompressed sequence length before the K new tokens.
+        # Use a value so that at least one new compressed block is produced.
+        prev_total_len = 64
+        buffer_len = kernel_size - 1
+        device = "cuda"
+        dtype = torch.bfloat16
+        num_heads = num_k_heads
+
+        torch.manual_seed(123 + K)
+        initial_buffer = torch.randn(buffer_len, num_heads, head_dim, device=device, dtype=dtype)
+        new_tokens = torch.randn(K, num_heads, head_dim, device=device, dtype=dtype)
+
+        # Method A: incremental (one token per call), collect and concat outputs
+        buffer = initial_buffer.clone()
+        prev = prev_total_len
+        outputs_A = []
+        for i in range(K):
+            out = _linear_compress_decode(
+                new_tokens[i : i + 1],
+                compress_key,
+                kernel_size,
+                kernel_stride,
+                intra_block_pe,
+                prev,
+                buffer,
+            )
+            if out is not None:
+                outputs_A.append(out)
+            buffer = torch.cat([buffer, new_tokens[i : i + 1]], dim=0)[-buffer_len:]
+            prev = prev + 1
+
+        result_A = torch.cat(outputs_A, dim=0) if outputs_A else None
+
+        # Method B: one call with all K tokens
+        result_B = _linear_compress_decode(
+            new_tokens,
+            compress_key,
+            kernel_size,
+            kernel_stride,
+            intra_block_pe,
+            prev_total_len,
+            initial_buffer,
+        )
+
+        if result_A is None and result_B is None:
+            print(f"  K={K}: both None (no new blocks) ✅")
+            continue
+        assert result_A is not None, f"K={K}: method A returned None but B did not"
+        assert result_B is not None, f"K={K}: method B returned None but A did not"
+        assert result_A.shape == result_B.shape, (
+            f"K={K}: shape mismatch A={result_A.shape} B={result_B.shape}"
+        )
+        torch.testing.assert_close(
+            result_A,
+            result_B,
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"K={K}: multi-token output != incremental output",
+        )
+        print(f"  K={K}: shape {result_A.shape} ✅")
+
+    print("EQUIVALENCE TEST COMPLETED")
 
     print("\n" + "="*60)
     print("DECODE TESTING COMPLETED")

@@ -42,6 +42,12 @@ def forward_kernel_orig(
     block_size,
     # sm_scale
     sm_scale,
+    # optional mask (total_q_len, total_k_len), 1=attend 0=mask
+    mask_ptr,
+    total_q_len,
+    total_k_len,
+    stride_mask_q,
+    stride_mask_k,
     # stride
     stride_qn,
     stride_qh,
@@ -69,6 +75,7 @@ def forward_kernel_orig(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    HAS_MASK: tl.constexpr,
 ):
     qk_scale = sm_scale * 1.44269504
     # get batch id and head id
@@ -162,6 +169,19 @@ def forward_kernel_orig(
                 qk += tl.where((pid_q_j >= c + off_k)[None, :], 0, float("-inf"))
                 # [BLOCK_SIZE_H, HEAD_DIM] @ [HEAD_DIM, BLOCK_SIZE_K] -> [BLOCK_SIZE_H, BLOCK_SIZE_K]
                 qk += tl.dot(q, k) * qk_scale
+                # optional tree/custom mask: 1=attend, 0=mask
+                if HAS_MASK:
+                    mask_ptrs = tl.make_block_ptr(
+                        base=mask_ptr,
+                        shape=(total_q_len, total_k_len),
+                        strides=(stride_mask_q, stride_mask_k),
+                        offsets=(q_start + pid_q_j, k_start + c),
+                        block_shape=(1, BLOCK_SIZE_K),
+                        order=(1, 0),
+                    )
+                    mask_block = tl.load(mask_ptrs, boundary_check=(0, 1), padding_option="zero")
+                    # (1, BLOCK_SIZE_K) -> broadcast to (BLOCK_SIZE_H, BLOCK_SIZE_K)
+                    qk = tl.where(mask_block > 0, qk, float("-inf"))
                 # compute m_ij and l_ij
                 m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
                 p = tl.exp2(qk - m_ij[:, None])
@@ -822,7 +842,9 @@ def _topk_sparse_attention_fwd(
     max_seqlen_q: int,
     max_seqlen_k: int,
     sm_scale: float,
+    attention_mask: torch.Tensor = None,
 ):
+    """attention_mask: optional (total_q_len, total_k_len), 1=attend 0=mask. Applied in kernel before softmax."""
     # dtype check
     assert k.dtype == q.dtype and v.dtype == q.dtype
     assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_k.dtype == torch.int32
@@ -836,6 +858,11 @@ def _topk_sparse_attention_fwd(
     topk = topk_idx.shape[-1]
     assert topk_idx.shape[0] == num_k_heads
     assert topk_idx.shape[1] == q_len
+    if attention_mask is not None:
+        assert attention_mask.shape == (q_len, k_len), (
+            f"attention_mask shape {attention_mask.shape} != (total_q_len, total_k_len) ({q_len}, {k_len})"
+        )
+        assert attention_mask.dtype == torch.float32, "attention_mask must be float32"
     # gqa
     assert num_k_heads == num_v_heads
     assert num_q_heads % num_k_heads == 0
@@ -858,6 +885,11 @@ def _topk_sparse_attention_fwd(
         )
         return grid
 
+    has_mask = attention_mask is not None
+    mask_ptr = attention_mask if has_mask else q
+    stride_mask_q = attention_mask.stride(0) if has_mask else 0
+    stride_mask_k = attention_mask.stride(1) if has_mask else 0
+
     num_warps, num_stages = get_num_warps_stages(head_dim, block_size, IS_HOPPER_GPU)
     forward_kernel_orig[grid](
         q,
@@ -873,8 +905,12 @@ def _topk_sparse_attention_fwd(
         head_dim,
         topk,
         block_size,
-        # num_q_loop,
         sm_scale,
+        mask_ptr,
+        q_len,
+        k_len,
+        stride_mask_q,
+        stride_mask_k,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -899,6 +935,7 @@ def _topk_sparse_attention_fwd(
         BLOCK_SIZE_D=BLOCK_SIZE_D,
         BLOCK_SIZE_H=BLOCK_SIZE_H,
         BLOCK_SIZE_T=BLOCK_SIZE_T,
+        HAS_MASK=has_mask,
         num_warps=num_warps,
         num_stages=num_stages,
     )

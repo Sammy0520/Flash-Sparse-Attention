@@ -57,6 +57,9 @@ class RopeConfig:
     # useless, just for compatibility, please use head_dim instead
     hidden_size: int = 4096
     num_attention_heads: int = 32
+    
+    def standardize_rope_params(self):
+        pass
 
 
 # copy and modify from modify from hugigngface transformers
@@ -123,13 +126,44 @@ class RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor, start: int = 0, stride: int = 1):
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        start: int = 0,
+        stride: int = 1,
+        position_ids: torch.Tensor = None,
+    ):
+        """Apply RoPE to varlen sequence.
+
+        Args:
+            x: [total_seqlen, num_heads, head_dim]
+            cu_seqlens: [batch+1]
+            start, stride: legacy positional scheme when position_ids is None.
+            position_ids: optional explicit positions, shape [total_seqlen].
+        """
         total_seqlen, num_heads, head_dim = x.shape
-        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seqlens.max().item()
-        max_position_ids = torch.arange(start, max_seqlen * stride + start, stride, device=x.device)[:max_seqlen]
-        cos, sin = self.generate_cos_sin(x, max_position_ids[None, ...])
-        cos, sin = cos.squeeze(0), sin.squeeze(0)
+        if position_ids is not None:
+            # explicit absolute positions for each token
+            assert position_ids.shape[0] == total_seqlen, (
+                f"position_ids length {position_ids.shape[0]} != total_seqlen {total_seqlen}"
+            )
+            pos = position_ids.to(x.device)
+            # generate_cos_sin expects [1, seqlen]
+            cos, sin = self.generate_cos_sin(x, pos[None, :])
+            cos, sin = cos.squeeze(0), sin.squeeze(0)
+            # flash_attn apply_rotary_emb uses cu_seqlens + max_seqlen to slice cos/sin per sequence
+            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seqlens.max().item()
+        else:
+            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seqlens.max().item()
+            max_position_ids = torch.arange(
+                start, max_seqlen * stride + start, stride, device=x.device
+            )[:max_seqlen]
+            cos, sin = self.generate_cos_sin(x, max_position_ids[None, ...])
+            cos, sin = cos.squeeze(0), sin.squeeze(0)
+
         x = apply_rotary_emb(x, cos, sin, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return x
 
