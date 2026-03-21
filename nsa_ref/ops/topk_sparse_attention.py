@@ -24,6 +24,221 @@ IS_HOPPER_GPU = is_hopper_gpu()
 
 
 @triton.jit
+def forward_kernel_coarsened(
+    q_ptr,  # Q: n x h x d
+    k_ptr,  # K: n x kh x d
+    v_ptr,  # V: n x kh x d
+    t_ptr,  # topk_idx: kh x n x k
+    o_ptr,  # O: n x h x d
+    lse_ptr,  # LSE: h x n
+    # seqlens
+    cu_seqlens_q,
+    cu_seqlens_k,
+    # shape
+    NUM_KV_HEADS,
+    NUM_SHARE_Q_HEADS,
+    HEAD_DIM,
+    TOPK,
+    block_size,
+    # sm_scale
+    sm_scale,
+    # optional mask (total_q_len, total_k_len), 1=attend 0=mask
+    mask_ptr,
+    total_q_len,
+    total_k_len,
+    stride_mask_q,
+    stride_mask_k,
+    # stride
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kn,
+    stride_kh,
+    stride_kd,
+    stride_vn,
+    stride_vh,
+    stride_vd,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_lh,
+    stride_ln,
+    # META parameters
+    # q loop num
+    num_q_loop: tl.constexpr,
+    num_k_loop: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # k block size
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    GROUP_SIZE: tl.constexpr = num_q_loop      # 4
+    GH:         tl.constexpr = GROUP_SIZE * BLOCK_SIZE_H
+
+    qk_scale = sm_scale * 1.44269504
+    # get batch id and head id
+    pid = tl.program_id(0)
+
+    Q = tl.cdiv(MAX_SEQ_LEN, num_q_loop)
+    HK = tl.cdiv(NUM_KV_HEADS, num_k_loop)
+
+    # 第几个 (b, kh_chunk, q_chunk)
+    pid_b = pid // (HK * Q)
+    pid_kh_chunk = (pid % (HK * Q)) // Q  # 每个block处理num_k_loop个KV head
+    pid_q = pid % Q
+
+    # get q k start and len after rmpad
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    k_start = tl.load(cu_seqlens_k + pid_b)
+    k_len = tl.load(cu_seqlens_k + pid_b + 1) - k_start
+
+    first_q_local = pid_q * GROUP_SIZE
+    if first_q_local >= q_len:
+        return
+
+    for kh_offset in range(num_k_loop):
+        pid_kh = pid_kh_chunk * num_k_loop + kh_offset
+        pid_h  = pid_kh * NUM_SHARE_Q_HEADS
+
+        # ── 只读一次 topk（取组内第一个 token 的）──────────────────────────
+        t_ptr0 = t_ptr + (q_start + first_q_local) * stride_tn + pid_kh * stride_th
+        off_t  = tl.arange(0, BLOCK_SIZE_T)
+        topk_blocks = tl.load(t_ptr0 + off_t * stride_tk, mask=off_t < TOPK, other=-1)
+        real_topk = tl.sum(
+            tl.where(
+                (topk_blocks >= 0) & (topk_blocks <= first_q_local // block_size),
+                1, 0,
+            )
+        )
+
+        # ── GH 行的 token / head 映射 ──────────────────────────────────────
+        off_gh   = tl.arange(0, GH)
+        j_of_row = off_gh // BLOCK_SIZE_H          # 组内第几个 token（0-3）
+        h_of_row = off_gh % BLOCK_SIZE_H           # token 内第几个 head
+        q_local_j = first_q_local + j_of_row       # 序列内 token 位置
+        abs_h_j   = pid_h + h_of_row               # 绝对 head 编号
+
+        valid_row = (q_local_j < q_len) & (h_of_row < NUM_SHARE_Q_HEADS)
+
+        # ── FIX 1：clamp head 下标，防止越界访问 ────────────────────────────
+        # 无效行（h_of_row >= NUM_SHARE_Q_HEADS）的 abs_h_j 会超出 Q 的 head 维，
+        # 产生非法指针。Clamp 到合法范围；valid_row=False 保证不写出结果。
+        safe_h_j = tl.minimum(abs_h_j, pid_h + NUM_SHARE_Q_HEADS - 1)
+
+        # q_local_j 也需要 clamp：最后一个 batch 可能越出 q_len
+        safe_q_local_j = tl.minimum(q_local_j, q_len - 1)
+        abs_q_j = q_start + safe_q_local_j
+
+        # ── 加载 Q（gather，每行对应一个 token×head 组合）─────────────────
+        off_d   = tl.arange(0, BLOCK_SIZE_D)
+        q_ptrs  = (q_ptr
+                   + abs_q_j[:, None]  * stride_qn
+                   + safe_h_j[:, None] * stride_qh   # 使用 safe_h_j
+                   + off_d[None, :]    * stride_qd)
+        q_all = tl.load(q_ptrs, mask=valid_row[:, None], other=0.0)
+        # q_all: [GH, BLOCK_SIZE_D]；无效行已被 mask 为 0
+
+        # ── K/V block 指针 ──────────────────────────────────────────────────
+        k_ptrs = tl.make_block_ptr(
+            base=k_ptr + k_start * stride_kn + pid_kh * stride_kh,
+            shape=(HEAD_DIM, k_len),
+            strides=(stride_kd, stride_kn),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+            order=(0, 1),
+        )
+        v_ptrs = tl.make_block_ptr(
+            base=v_ptr + k_start * stride_vn + pid_kh * stride_vh,
+            shape=(k_len, HEAD_DIM),
+            strides=(stride_vn, stride_vd),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+
+        # ── Online softmax 状态初始化（GH 行共享）────────────────────────
+        m_i   = tl.full([GH], float("-inf"), dtype=tl.float32)
+        lse_i = tl.full([GH], float("-inf"), dtype=tl.float32)
+        acc_o = tl.zeros([GH, BLOCK_SIZE_D],  dtype=tl.float32)
+
+        off_k     = tl.arange(0, BLOCK_SIZE_K)
+        t_ptr_cur = t_ptr0
+
+        # ── 稀疏注意力主循环：K/V 只加载一次，GROUP_SIZE 个 token 共享 ────
+        for _ in range(real_topk):
+            c = tl.load(t_ptr_cur).to(tl.int32) * BLOCK_SIZE_K
+            t_ptr_cur += stride_tk
+
+            # ★ 核心收益：K 和 V 每个 block 只读一次
+            k = tl.load(tl.advance(k_ptrs, (0, c)),
+                        boundary_check=(1,), padding_option="zero")
+            v = tl.load(tl.advance(v_ptrs, (c, 0)),
+                        boundary_check=(0,), padding_option="zero")
+
+            # QK：[GH, D] @ [D, BK] → [GH, BK]，一次矩阵乘处理所有 token
+            qk = tl.dot(q_all, k) * qk_scale
+
+            # 因果 mask + 越界 mask + 无效行 mask
+            k_pos      = c + off_k
+            causal_ok  = (q_local_j[:, None] >= k_pos[None, :]) & (k_pos[None, :] < k_len)
+            qk = tl.where(causal_ok & valid_row[:, None], qk, float("-inf"))
+
+            if HAS_MASK:
+                m_ptrs = (mask_ptr
+                          + abs_q_j[:, None]              * stride_mask_q
+                          + (k_start + k_pos)[None, :]    * stride_mask_k)
+                mask_block = tl.load(
+                    m_ptrs,
+                    mask=valid_row[:, None] & (k_pos[None, :] < k_len),
+                    other=0.0,
+                )
+                qk = tl.where(mask_block > 0, qk, float("-inf"))
+
+            # ── FIX 2：防止 -inf - (-inf) = NaN ───────────────────────────
+            # 无效行 qk 全为 -inf → m_ij_raw = -inf → exp2(-inf-(-inf)) = NaN
+            # 解决：将 -inf 的 m_ij clamp 到 0（任意有限值），同时把 p 置零
+            m_ij_raw  = tl.max(qk, axis=1)                        # [GH]
+            m_ij      = tl.maximum(m_i, m_ij_raw)
+            m_ij_safe = tl.where(m_ij > float("-inf"), m_ij, 0.0) # 无效行 → 0
+
+            p    = tl.exp2(qk - m_ij_safe[:, None])               # [GH, BK]
+            p    = tl.where(valid_row[:, None], p, 0.0)            # ★ 无效行归零，
+            # 防止 NaN 通过 tl.dot 污染有效行
+            l_ij = tl.sum(p, axis=1)                               # [GH]
+
+            acc_o_scale = tl.exp2(m_i - m_ij_safe)
+            acc_o = acc_o * acc_o_scale[:, None]
+            acc_o = acc_o + tl.dot(p.to(v.dtype), v)
+
+            m_i   = m_ij   # 保留 -inf（用于 lse 追踪）
+            lse_i = m_ij_safe + tl.math.log2(
+                tl.exp2(lse_i - m_ij_safe) + l_ij
+            )  # 无效行：0 + log2(0+0) = -inf，自然保持 -inf ✓
+
+        # ── 归一化 ─────────────────────────────────────────────────────────
+        lse_safe = tl.where(lse_i > float("-inf"), lse_i, 0.0)
+        acc_o    = acc_o * tl.exp2(m_i - lse_safe)[:, None]
+
+        # ── 写回 Output ────────────────────────────────────────────────────
+        o_ptrs = (o_ptr
+                  + abs_q_j[:, None]  * stride_on
+                  + safe_h_j[:, None] * stride_oh   # 同样使用 safe_h_j
+                  + off_d[None, :]    * stride_od)
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty),
+                 mask=valid_row[:, None])
+
+        # ── 写回 LSE ───────────────────────────────────────────────────────
+        lse_ptrs = lse_ptr + abs_q_j * stride_ln + safe_h_j * stride_lh
+        tl.store(lse_ptrs, lse_i, mask=valid_row)
+
+
+@triton.jit
 def forward_kernel_orig(
     q_ptr,  # Q: n x h x d
     k_ptr,  # K: n x kh x d
@@ -81,8 +296,8 @@ def forward_kernel_orig(
     # get batch id and head id
     pid = tl.program_id(0)
 
-    Q = MAX_SEQ_LEN // num_q_loop
-    HK = NUM_KV_HEADS // num_k_loop
+    Q = tl.cdiv(MAX_SEQ_LEN, num_q_loop)
+    HK = tl.cdiv(NUM_KV_HEADS, num_k_loop)
 
     # 第几个 (b, kh_chunk, q_chunk)
     pid_b = pid // (HK * Q)
@@ -873,7 +1088,8 @@ def _topk_sparse_attention_fwd(
     lse = torch.zeros(num_q_heads, q_len, dtype=torch.float32, device=q.device)
 
     # launch kernel
-    num_q_loop = num_k_loop = 1
+    num_q_loop = 4
+    num_k_loop = 1
     BLOCK_SIZE_K = triton.next_power_of_2(block_size)
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     BLOCK_SIZE_H = max(16, triton.next_power_of_2(num_share_q_heads))
@@ -891,7 +1107,7 @@ def _topk_sparse_attention_fwd(
     stride_mask_k = attention_mask.stride(1) if has_mask else 0
 
     num_warps, num_stages = get_num_warps_stages(head_dim, block_size, IS_HOPPER_GPU)
-    forward_kernel_orig[grid](
+    forward_kernel_coarsened[grid](
         q,
         k,
         v,
