@@ -331,6 +331,7 @@ if __name__ == "__main__":
         cmp_v_cache,
         attention_mask=None,
         position_ids=pos_ids32,
+        use_splitk_impl=True,
     )
     assert y_pos32.shape == (total_q_len32, args.hidden_size), y_pos32.shape
     assert not torch.isnan(y_pos32).any() and not torch.isinf(y_pos32).any()
@@ -355,6 +356,7 @@ if __name__ == "__main__":
             cmp_v_cache,
             attention_mask=None,
             position_ids=pos_prefix32,
+            use_splitk_impl=False,
         )
         y_single_list32.append(y_prefix32[-1])
 
@@ -389,6 +391,7 @@ if __name__ == "__main__":
                     v_cache,
                     cmp_k_cache,
                     cmp_v_cache,
+                    use_splitk_impl=False,
                 )
         end_event.record()
         torch.cuda.synchronize()
