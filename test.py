@@ -91,6 +91,8 @@ def generate_test_data(
         )
         # Force first topk entry to block 0 so every token has at least one valid block
         topk_idx[:, :, 0] = 0
+        topk_idx = torch.sort(topk_idx, dim=-1)[0]
+        #print(topk_idx)
 
     sm_scale = 1.0 / math.sqrt(head_dim)
 
@@ -114,7 +116,7 @@ def run_benchmark():
     print(f"{'TopK':<10} | {'Baseline (ms)':<15} | {'Opt (ms)':<15} | {'Speedup':<10} | {'Correct'}")
     print("-" * 80)
 
-    for topk in [64, 128, 256, 512, 1024, 2048]:
+    for topk in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]:
         (q, k, v, topk_idx,
          cu_q, cu_k,
          sm_scale, max_seqlen_q, max_seqlen_k) = generate_test_data(

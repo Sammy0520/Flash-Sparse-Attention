@@ -65,31 +65,22 @@ def forward_kernel_split_k(
     if pid_seq_q >= q_len:
         return
 
-    # Load q
     BLOCK_H: tl.constexpr = num_share_q_heads if num_share_q_heads >= 16 else 16
     pid_q_len = q_start + pid_seq_q # [0, total_q_len)
 
+    # Load topk
     topk_idx_base_ptr = topk_idx_ptr + pid_k_heads * stride_th + pid_q_len * stride_tl
     offs_topk = tl.arange(0, topk)
-    topk_idx = tl.load(
-        topk_idx_base_ptr + offs_topk * stride_tk,
-        mask=offs_topk < topk,
-        other=-1,
-    ) # [topk]
-    real_topk = tl.sum(
-        tl.where(
-            (topk_idx >= 0) & (topk_idx <= pid_seq_q // block_size_k),
-            1, 0
-        ),
-        axis=0,
-    )
+    topk_idx = tl.load(topk_idx_base_ptr + offs_topk * stride_tk) # [topk]
 
     # Calculate topk range
+    real_topk = tl.sum(tl.where(topk_idx >= 0, 1, 0), axis=0)
     chunk_size: tl.constexpr = topk // SPLIT_K
     start_topk = pid_split_k * chunk_size
     end_topk = start_topk + chunk_size
     real_end_topk = tl.minimum(end_topk, real_topk)
 
+    # Load q
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + pid_q_len * stride_ql + pid_q_heads * stride_qh,
         shape=(num_share_q_heads, head_dim),
@@ -154,7 +145,8 @@ def forward_kernel_split_k(
 
             # Compute m_ij and l_ij
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1)) # [BLOCK_H]
-            p = tl.exp2(qk - m_ij[:, None]) # [BLOCK_H, block_size_k]
+            qk_shift = tl.where(m_ij[:, None] > float('-inf'), qk - m_ij[:, None], float('-inf'))
+            p = tl.exp2(qk_shift) # [BLOCK_H, block_size_k]
             l_ij = tl.sum(p, axis=1) # [BLOCK_H]
 
             # Load v
@@ -162,11 +154,13 @@ def forward_kernel_split_k(
 
             # Update acc_o
             acc_o_scale = tl.exp2(m_i - m_ij)
+            acc_o_scale = tl.where(m_ij > float('-inf'), acc_o_scale, 1.0)
             acc_o = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
 
             # Update m_i, lse_i
             m_i = m_ij
-            lse_i = m_ij + tl.math.log2(tl.exp2(lse_i - m_ij) + l_ij)
+            lse_i_new = m_ij + tl.math.log2(tl.exp2(lse_i - m_ij) + l_ij)
+            lse_i = tl.where(m_ij > float('-inf'), lse_i_new, lse_i)
 
     # Final scale
     exp_arg = tl.where(lse_i > float('-inf'), m_i - lse_i, float('-inf'))
