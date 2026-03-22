@@ -317,6 +317,7 @@ def _topk_sparse_attention_fwd(
         batch_size * num_k_heads * max_seqlen_q,
         SPLIT_K,
     )
+    # print(batch_size, num_k_heads, max_seqlen_q, SPLIT_K)
     # print(batch_size * num_k_heads * max_seqlen_q * SPLIT_K)
     forward_kernel_split_k[grid](
         # tensors
