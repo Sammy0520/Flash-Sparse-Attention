@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from nsa_ref.ops.topk_sparse_attention import _topk_sparse_attention_fwd
+from nsa_ref.ops.topk_sparse_attention import _topk_sparse_attention_fwd, _topk_sparse_attention_fwd_v2
 
 
 def _topk_sparse_attention_decode(
@@ -17,6 +17,7 @@ def _topk_sparse_attention_decode(
     max_seqlen_k: torch.Tensor,
     sm_scale=None,
     attention_mask: torch.Tensor = None,
+    use_splitk_impl: bool = True,
 ):
     # attention_mask: optional (total_q_len, total_k_len) or (num_heads, total_q_len, total_k_len), 1=attend 0=mask. Applied in kernel.
     # dtype check
@@ -37,7 +38,19 @@ def _topk_sparse_attention_decode(
         if mask_2d.dtype != torch.float32:
             mask_2d = mask_2d.to(torch.float32)
 
-    o, lse = _topk_sparse_attention_fwd(
+    o, _ = _topk_sparse_attention_fwd_v2(
+        q,
+        k,
+        v,
+        topk_idx,
+        block_size,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        sm_scale,
+        attention_mask=mask_2d,
+    ) if use_splitk_impl else _topk_sparse_attention_fwd(
         q,
         k,
         v,

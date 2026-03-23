@@ -15,12 +15,12 @@ from nsa_ref.ops import linear_compress
 if __name__ == "__main__":
     torch.manual_seed(42)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seqlen", type=int, default=1000)
-    parser.add_argument("--seqlens", nargs="+", type=int, default=[1000])
+    parser.add_argument("--seqlen", type=int, default=131072)
+    parser.add_argument("--seqlens", nargs="+", type=int, default=[131072])
     parser.add_argument("--heads", type=int, default=1)
     parser.add_argument("--kv-heads", type=int, default=-1)
     parser.add_argument("--gqa-deg", type=int, default=1)
-    parser.add_argument('--topk', type=int, default=16)
+    parser.add_argument('--topk', type=int, default=2048)
     parser.add_argument('--attn-mode', type=str, default="FSA")
     parser.add_argument("--kernel-size", type=int, default=32)
     parser.add_argument("--kernel-stride", type=int, default=16)
@@ -409,10 +409,33 @@ if __name__ == "__main__":
                 v_cache,
                 cmp_k_cache,
                 cmp_v_cache,
+                use_splitk_impl=False,
             )
         end_event.record()
         torch.cuda.synchronize()
         time_N = start_event.elapsed_time(end_event) / num_iters
 
-        print(f"[Perf] N={N}: 1-token * N total: {time_1xN:.3f} ms")
-        print(f"[Perf] N={N}: N-token once:      {time_N:.3f} ms\n")
+        # N-token 一次 (splitk)
+        xN = torch.randn(N, args.hidden_size, device="cuda", dtype=DTYPE)
+        cu_seqlens_qN = torch.tensor([0, N], device="cuda", dtype=torch.int32)
+
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(num_iters):
+            sparse_attn(
+                xN,
+                cu_seqlens_qN,
+                cu_seqlens,
+                k_cache,
+                v_cache,
+                cmp_k_cache,
+                cmp_v_cache,
+                use_splitk_impl=True,
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        time_N_splitk = start_event.elapsed_time(end_event) / num_iters
+
+        print(f"[Perf] N={N}: 1-token * N total:         {time_1xN:.3f} ms")
+        print(f"[Perf] N={N}: N-token once:              {time_N:.3f} ms")
+        print(f"[Perf] N={N}: N-token once with split-k: {time_N_splitk:.3f} ms\n")

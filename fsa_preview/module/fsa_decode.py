@@ -73,6 +73,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         cmp_v_cache: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
         position_ids: torch.Tensor = None,
+        use_splitk_impl: bool = True,
     ):
         """
         Args:
@@ -216,6 +217,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             seqlens_k.max().item(),
             None,
             attention_mask=attention_mask,
+            use_splitk_impl=use_splitk_impl,
         )
 
         # sliding window attention (flash_attn does not support custom mask; sliding branch never applies attention_mask)
