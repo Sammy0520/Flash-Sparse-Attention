@@ -134,32 +134,31 @@ def run_benchmark():
 
         ref_o,  ref_lse  = topk_sparse_attention_fwd_baseline(*common_args)
         sp_o,  sp_lse  = topk_sparse_attention_fwd_splitk(*common_args)
-        cs_o, cs_lse = topk_sparse_attention_fwd_coarsening(*common_args)
-
+        cs_o, cs_lse = topk_sparse_attention_fwd_coarsening(*common_args, CFACTOR=1)
 
         is_correct = "PASS"
         try:
             torch.testing.assert_close(sp_o,   ref_o,   atol=1e-2, rtol=1e-2, equal_nan=False)
             torch.testing.assert_close(sp_lse,  ref_lse, atol=1e-2, rtol=1e-2, equal_nan=False)
-            # torch.testing.assert_close(cs_o,   ref_o,   atol=1e-2, rtol=1e-2, equal_nan=False)
-            # torch.testing.assert_close(cs_lse,  ref_lse, atol=1e-2, rtol=1e-2, equal_nan=False)
+            torch.testing.assert_close(cs_o,   ref_o,   atol=1e-2, rtol=1e-2, equal_nan=False)
+            torch.testing.assert_close(cs_lse,  ref_lse, atol=1e-2, rtol=1e-2, equal_nan=False)
         except Exception:
             is_correct = "FAIL"
             print(f"\n{'='*80}")
             print(f"FAIL: TopK={topk}")
             print(f"{'='*80}")
-            print_error_stats(compute_error_stats(ref_o,   sp_o,   "Output (O)"))
+            print_error_stats(compute_error_stats(ref_o,   sp_o, "Output (O)"))
             print_error_stats(compute_error_stats(ref_lse, sp_lse, "Log-Sum-Exp (LSE)"))
             print(f"{'='*80}\n")
 
         if is_correct == "PASS":
             ms_base = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_baseline(*common_args))
             ms_splitk  = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_splitk(*common_args, SPLIT_K=16))
-            ms_coarsen = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_coarsening(*common_args))
+            ms_coarsen = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_coarsening(*common_args, SPLIT_K=64, CFACTOR=4))
             speedup_splitk = ms_base / ms_splitk
             speedup_coarsen = ms_base / ms_coarsen
             print(f"{topk:<6} | {'Split-K':<18} | {ms_base:>9.3f} | {ms_splitk:>9.3f} | {speedup_splitk:>7.2f}x | {is_correct}")
-            print(f"{topk:<6} | {'Coarsening+Split-K':<18} | {ms_base:>9.3f} | {ms_coarsen:>9.3f} | {speedup_coarsen:>7.2f}x | {is_correct}")
+            print(f"{topk:<6} | {'Coarsening+Split-K':<18} | {ms_base:>9.3f} | {ms_coarsen:>9.3f} | {speedup_coarsen:>7.2f}x | {is_correct} with CFACTOR 1")
 
 
 if __name__ == "__main__":
