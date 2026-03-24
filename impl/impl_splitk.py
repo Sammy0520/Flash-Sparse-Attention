@@ -129,7 +129,7 @@ def forward_kernel_split_k(
             k = tl.load(tl.advance(k_ptrs, (0, c)), boundary_check=(1, 0), padding_option="zero") # [head_dim, block_size_k]
 
             qk = tl.dot(q, k) * qk_scale # [BLOCK_H, block_size_k]
-            qk += tl.where((pid_seq_q >= (kv_idx * block_size_k) + offs_block_size_k)[None, :], 0, float("-inf"))
+            #qk += tl.where((pid_seq_q >= (kv_idx * block_size_k) + offs_block_size_k)[None, :], 0, float("-inf"))
 
             if HAS_MASK:
                 attention_mask_ptrs = tl.make_block_ptr(

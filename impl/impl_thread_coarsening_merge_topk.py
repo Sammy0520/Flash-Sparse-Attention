@@ -227,10 +227,10 @@ def forward_kernel_split_k(
             qk = tl.dot(q, k) * qk_scale  # [BLOCK_CF_H, block_size_k]
 
             # Per-row causal mask — each token sees only its own past
-            qk += tl.where(
-                seq_q_for_row[:, None] >= (kv_idx * block_size_k + offs_bk)[None, :],
-                0, float("-inf"),
-            )
+            # qk += tl.where(
+            #     seq_q_for_row[:, None] >= (kv_idx * block_size_k + offs_bk)[None, :],
+            #     0, float("-inf"),
+            # )
 
             if HAS_MASK:
                 # Load mask for every token row in the group

@@ -141,10 +141,10 @@ def forward_kernel_split_k(
 
             qk = tl.dot(q, k) * qk_scale  # [BLOCK_CF_H, block_size_k]
             # Causal mask — each row uses its own seq position
-            qk += tl.where(
-                seq_q_for_row[:, None] >= (kv_idx * block_size_k + offs_bk)[None, :],
-                0, float("-inf"),
-            )
+            # qk += tl.where(
+            #     seq_q_for_row[:, None] >= (kv_idx * block_size_k + offs_bk)[None, :],
+            #     0, float("-inf"),
+            # )
 
             if HAS_MASK:
                 mask_ptrs = tl.make_block_ptr(
