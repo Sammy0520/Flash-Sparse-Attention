@@ -4,7 +4,8 @@ import math
 
 from impl.impl_baseline import _topk_sparse_attention_fwd as topk_sparse_attention_fwd_baseline
 from impl.impl_splitk import _topk_sparse_attention_fwd as topk_sparse_attention_fwd_splitk
-from impl.impl_thread_coarsening import _topk_sparse_attention_fwd as topk_sparse_attention_fwd_coarsening
+from impl.impl_thread_coarsening_first_topk import _topk_sparse_attention_fwd as topk_sparse_attention_fwd_coarsening_first_topk
+from impl.impl_thread_coarsening_merge_topk import _topk_sparse_attention_fwd as topk_sparse_attention_fwd_coarsening_merge_topk
 #topk_sparse_attention_fwd_opt = topk_sparse_attention_fwd_baseline
 
 
@@ -82,18 +83,30 @@ def generate_test_data(
     if topk_idx_all_zero:
         topk_idx = torch.zeros(num_kv_heads, total_q_len, topk, dtype=torch.int32, device=device)
     else:
-        # shared_topk = torch.randperm(num_blocks, device=device)[:topk].to(torch.int32)
-        # shared_topk[0] = 0
-        # topk_idx = shared_topk.view(1, 1, topk).expand(num_kv_heads, total_q_len, topk).contiguous()
-        topk_idx = torch.randint(
+        CFACTOR = 4
+        SIMILARITY = 0.80
+        num_shared = int(topk * SIMILARITY)
+        num_unique = topk - num_shared
+
+        num_groups = (total_q_len + CFACTOR - 1) // CFACTOR
+        base_topk = torch.randint(
             0, num_blocks,
-            (num_kv_heads, total_q_len, topk),
-            dtype=torch.int32, device=device,
+            (num_kv_heads, num_groups, num_shared),
+            dtype=torch.int32, device=device
         )
-        # Force first topk entry to block 0 so every token has at least one valid block
-        topk_idx[:, :, 0] = 0
-        topk_idx = torch.sort(topk_idx, dim=-1)[0]
-        #print(topk_idx)
+
+        topk_idx_shared = base_topk.repeat_interleave(CFACTOR, dim=1)[:, :total_q_len, :]
+
+        topk_idx_unique = torch.randint(
+            0, num_blocks,
+            (num_kv_heads, total_q_len, num_unique),
+            dtype=torch.int32, device=device
+        )
+
+        topk_idx = torch.cat([topk_idx_shared, topk_idx_unique], dim=-1)
+        topk_idx[:, :, 0] = 0 # 强制包含第 0 块，保证不为空
+
+        topk_idx, _ = torch.sort(topk_idx, dim=-1)
 
     sm_scale = 1.0 / math.sqrt(head_dim)
 
@@ -114,7 +127,7 @@ def run_benchmark():
 
     print(f"--- Benchmark: total_q_len={total_q_len}, batch_size=1, "
           f"HeadDim={head_dim}, Context={context_len//1024}K ---")
-    print(f"{'TopK':<6} | {'Kernel':<18} | {'Base (ms)':<10} | {'Opt (ms)':<10} | {'Speedup':<8} | {'Status'}")
+    print(f"{'TopK':<6} | {'Kernel':<32} | {'Base (ms)':<10} | {'Opt (ms)':<10} | {'Speedup':<8} | {'Status'}")
     print("-" * 80)
 
     for topk in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]:
@@ -134,7 +147,8 @@ def run_benchmark():
 
         ref_o,  ref_lse  = topk_sparse_attention_fwd_baseline(*common_args)
         sp_o,  sp_lse  = topk_sparse_attention_fwd_splitk(*common_args)
-        cs_o, cs_lse = topk_sparse_attention_fwd_coarsening(*common_args, CFACTOR=1)
+        cs_o, cs_lse = topk_sparse_attention_fwd_coarsening_first_topk(*common_args, CFACTOR=1)
+        cs_o_2, cs_lse_2 = topk_sparse_attention_fwd_coarsening_first_topk(*common_args, CFACTOR=1)
 
         is_correct = "PASS"
         try:
@@ -142,6 +156,8 @@ def run_benchmark():
             torch.testing.assert_close(sp_lse,  ref_lse, atol=1e-2, rtol=1e-2, equal_nan=False)
             torch.testing.assert_close(cs_o,   ref_o,   atol=1e-2, rtol=1e-2, equal_nan=False)
             torch.testing.assert_close(cs_lse,  ref_lse, atol=1e-2, rtol=1e-2, equal_nan=False)
+            torch.testing.assert_close(cs_o_2,   ref_o,   atol=1e-2, rtol=1e-2, equal_nan=False)
+            torch.testing.assert_close(cs_lse_2,  ref_lse, atol=1e-2, rtol=1e-2, equal_nan=False)
         except Exception:
             is_correct = "FAIL"
             print(f"\n{'='*80}")
@@ -154,11 +170,15 @@ def run_benchmark():
         if is_correct == "PASS":
             ms_base = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_baseline(*common_args))
             ms_splitk  = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_splitk(*common_args, SPLIT_K=16))
-            ms_coarsen = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_coarsening(*common_args, SPLIT_K=64, CFACTOR=4))
+            ms_coarsen_first_topk = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_coarsening_first_topk(*common_args, SPLIT_K=64, CFACTOR=4))
+            ms_coarsen_merge_topk = triton.testing.do_bench(lambda: topk_sparse_attention_fwd_coarsening_merge_topk(*common_args, SPLIT_K=64, CFACTOR=4, topk_idx_coarsen_scale=2))
             speedup_splitk = ms_base / ms_splitk
-            speedup_coarsen = ms_base / ms_coarsen
-            print(f"{topk:<6} | {'Split-K':<18} | {ms_base:>9.3f} | {ms_splitk:>9.3f} | {speedup_splitk:>7.2f}x | {is_correct}")
-            print(f"{topk:<6} | {'Coarsening+Split-K':<18} | {ms_base:>9.3f} | {ms_coarsen:>9.3f} | {speedup_coarsen:>7.2f}x | {is_correct} with CFACTOR 1")
+            speedup_coarsen_first_topk = ms_base / ms_coarsen_first_topk
+            speedup_coarsen_merge_topk = ms_base / ms_coarsen_merge_topk
+            print('\n')
+            print(f"{topk:<6} | {'Split-K':<32} | {ms_base:>9.3f} | {ms_splitk:>9.3f} | {speedup_splitk:>7.2f}x | {is_correct}")
+            print(f"{topk:<6} | {'Coarsening(merge topk)+Split-K':<32} | {ms_base:>9.3f} | {ms_coarsen_merge_topk:>9.3f} | {speedup_coarsen_merge_topk:>7.2f}x | {is_correct} with CFACTOR 1")
+            print(f"{topk:<6} | {'Coarsening(first topk)+Split-K':<32} | {ms_base:>9.3f} | {ms_coarsen_first_topk:>9.3f} | {speedup_coarsen_first_topk:>7.2f}x | {is_correct} with CFACTOR 1")
 
 
 if __name__ == "__main__":
