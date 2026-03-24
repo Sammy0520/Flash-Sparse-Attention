@@ -294,6 +294,15 @@ def _topk_sparse_attention_fwd(
         )
         assert attention_mask.dtype == torch.float32, "attention_mask must be float32"
 
+    # check and fix CFACTOR
+    assert is_power_of_two(CFACTOR)
+
+    # if max_seqlen_q % CFACTOR != 0:
+    #     print("Warn: max_seqlen_q % CFACTOR != 0")
+
+    while CFACTOR > 1 and max_seqlen_q % CFACTOR != 0:
+        CFACTOR >>= 1
+
     # gqa
     assert num_k_heads == num_v_heads
     assert num_q_heads % num_k_heads == 0
