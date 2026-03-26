@@ -3,6 +3,7 @@ import triton
 import math
 from impl.impl_baseline import _compressed_attention_fwd_decode as compressed_attention_fwd_decode_baseline
 from impl.impl_splitk import _compressed_attention_fwd_decode as compressed_attention_fwd_decode_splitk
+from impl.impl_splitk_fp8_quant import _compressed_attention_fwd_decode as compressed_attention_fwd_decode_splitk_fp8_quant
 
 
 def compute_error_stats(ref_o, opt_o, ref_lse, opt_lse):
@@ -35,6 +36,9 @@ def run_test():
     q = torch.randn((total_q_len, num_q_heads, head_dim), dtype=dtype, device=device)
     k = torch.randn((compressed_k_len, num_kv_heads, head_dim), dtype=dtype, device=device)
     v = torch.randn((compressed_k_len, num_kv_heads, head_dim), dtype=dtype, device=device)
+    v_scale = v.abs().max(dim=-1)[0] / 448.0
+    v_scale = torch.where(v_scale == 0, 1.0, v_scale).to(torch.bfloat16)
+    v_fp8 = (v / v_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     
     # Batch size = 1
     cu_seqlens_q = torch.tensor([0, total_q_len], dtype=torch.int32, device=device)
@@ -107,16 +111,24 @@ def run_test():
             sm_scale, query_start_index, SPLIT_K=4
         ))
 
+        ms_opt_16_fp8_quant = triton.testing.do_bench(lambda: compressed_attention_fwd_decode_splitk_fp8_quant(
+            q, k, v_fp8, v_scale, kernel_size, kernel_stride, 
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            sm_scale, query_start_index, SPLIT_K=16
+        ))
+
         print(f"\nPerformance:")
         print(f"  Baseline: {ms_base:.4f} ms")
         print(f"  Split-K(32):  {ms_opt_32:.4f} ms")
         print(f"  Split-K(16):  {ms_opt_16:.4f} ms")
         print(f"  Split-K(8):  {ms_opt_8:.4f} ms")
         print(f"  Split-K(4):  {ms_opt_4:.4f} ms")
+        print(f"  Split-K(16)+fp8_quant:  {ms_opt_16_fp8_quant:.4f} ms")
         print(f"  Speedup(32):  {ms_base / ms_opt_32:.2f}x")
         print(f"  Speedup(16):  {ms_base / ms_opt_16:.2f}x")
         print(f"  Speedup(8):  {ms_base / ms_opt_8:.2f}x")
         print(f"  Speedup(4):  {ms_base / ms_opt_4:.2f}x")
+        print(f"  Speedup(16,fp8):  {ms_base / ms_opt_16_fp8_quant:.2f}x")
 
 
 if __name__ == "__main__":
