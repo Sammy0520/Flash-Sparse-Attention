@@ -72,6 +72,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         cmp_v_cache: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
         position_ids: torch.Tensor = None,
+        use_dedup: bool = False,
     ):
         """
         Args:
@@ -82,7 +83,9 @@ class FlashSparseAttentionDecode(torch.nn.Module):
                 does not apply it (flash_attn has no custom mask API); for full tree semantics, add mask in compressed/topk kernels.
             position_ids: Optional absolute positions for current queries/keys, shape (total_q_len,).
                 For linear multi-token decode, typically `arange(past_len, past_len + q_len)`.
+            use_dedup: Reserved for duplicate-KV dedup kernel; currently ignored.
         """
+        _ = use_dedup  # TODO: wire to topk/compressed path when kernel is ready
         # dtype and shape check
         assert x.dtype == torch.bfloat16 or x.dtype == torch.float16
         assert x.shape[-1] == self.hidden_size
@@ -131,11 +134,13 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         ).to(torch.int32)
 
         # compressed key and value before rope
-        # Prepare initial buffer with some context from first part
-        # Need last (kernel_size-1) tokens from first part for potential overlapping windows
-        buffer_size = min(self.kernel_size - 1, cmp_k_cache.shape[0])
-        initial_buffer_k = cmp_k_cache[-buffer_size:] if buffer_size > 0 else None
-        initial_buffer_v = cmp_v_cache[-buffer_size:] if buffer_size > 0 else None
+        # _linear_compress_decode 使用「未压缩」序列坐标：prev_total_len 为追加 k_new 前的原始 KV
+        # 长度；token_buffer 为边界重叠窗口，须为 **原始** K/V 尾部。误用 cmp_* 长度或已压缩向量
+        # 会导致窗口索引错误或对已压缩特征再次 linear_compress（长上下文下偏差放大）。
+        prev_raw_len = k_cache.shape[0]
+        buffer_size = min(self.kernel_size - 1, prev_raw_len)
+        initial_buffer_k = k_cache[-buffer_size:] if buffer_size > 0 else None
+        initial_buffer_v = v_cache[-buffer_size:] if buffer_size > 0 else None
 
         # Decode the last part
         decode_k_output = _linear_compress_decode(
@@ -144,7 +149,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             self.kernel_size,
             self.kernel_stride,
             self.intra_block_pe,
-            cmp_k_cache.shape[0],
+            prev_raw_len,
             initial_buffer_k,
         )
 
@@ -154,7 +159,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             self.kernel_size,
             self.kernel_stride,
             None,
-            cmp_v_cache.shape[0],
+            prev_raw_len,
             initial_buffer_v,
         )
         # Combine results

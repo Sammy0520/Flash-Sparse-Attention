@@ -166,7 +166,7 @@ def forward_kernel_orig(
                 k = tl.load(tl.advance(k_ptrs, (0, c)), boundary_check=(1, 0), padding_option="zero")
                 # compute qk
                 qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-                qk += tl.where((pid_q_j >= c + off_k)[None, :], 0, float("-inf"))
+                #qk += tl.where((pid_q_j >= c + off_k)[None, :], 0, float("-inf"))
                 # [BLOCK_SIZE_H, HEAD_DIM] @ [HEAD_DIM, BLOCK_SIZE_K] -> [BLOCK_SIZE_H, BLOCK_SIZE_K]
                 qk += tl.dot(q, k) * qk_scale
                 # optional tree/custom mask: 1=attend, 0=mask
@@ -816,7 +816,7 @@ def backward_dq(
             v = tl.load(tl.advance(v_ptrs, (0, c)), boundary_check=(0, 1), padding_option="zero")
             # compute qk
             qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            qk += tl.where((pid_q_j >= c + off_k)[None, :], 0, float("-inf"))
+            #qk += tl.where((pid_q_j >= c + off_k)[None, :], 0, float("-inf"))
             # [BLOCK_SIZE_H, HEAD_DIM] @ [BLOCK_SIZE_K, HEAD_DIM].T -> [BLOCK_SIZE_H, BLOCK_SIZE_K]
             qk += tl.dot(q, tl.trans(k)) * qk_scale
             # compute p, ds
