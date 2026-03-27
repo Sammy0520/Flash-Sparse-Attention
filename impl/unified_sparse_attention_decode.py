@@ -208,11 +208,10 @@ def forward_kernel_unified(
     )
 
     for i in range(0, real_fused_idx_cnt):
-        # load and decode hybrid_idx
-        hybrid_idx = tl.load(hybrid_idx_base_ptr + i * stride_hf)
-        raw_idx = hybrid_idx & NOT_BITS
-        is_topk = (hybrid_idx & TOPK_BIT) != 0
-        is_win = (hybrid_idx & WINDOW_BIT) != 0
+        hybrid_idx_cur = tl.load(hybrid_idx_base_ptr + i * stride_hf)
+        raw_idx = hybrid_idx_cur & NOT_BITS
+        is_topk = (hybrid_idx_cur & TOPK_BIT) != 0
+        is_win = (hybrid_idx_cur & WINDOW_BIT) != 0
 
         # compute gate value and index
         gate_val = tl.where(is_topk, gate_topk, 0.0) + tl.where(is_win, gate_win, 0.0)
