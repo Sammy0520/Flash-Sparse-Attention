@@ -94,11 +94,13 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
 
         # qkv proj
-        q = self.proj_q(x).view(-1, self.num_q_heads, self.head_dim)
-        k_new = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
-        v_new = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
-        k = torch.cat([k_cache, k_new], dim=0)
-        v = torch.cat([v_cache, v_new], dim=0)
+        with torch.profiler.record_function("FSA_decode.qkv_proj"):
+            q = self.proj_q(x).view(-1, self.num_q_heads, self.head_dim)
+            k_new = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
+            v_new = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
+        with torch.profiler.record_function("FSA_decode.kv_cat"):
+            k = torch.cat([k_cache, k_new], dim=0)
+            v = torch.cat([v_cache, v_new], dim=0)
 
         if position_ids is not None:
             # explicit absolute positions for the new queries/keys; only linear (single-batch) supported here
@@ -121,17 +123,18 @@ class FlashSparseAttentionDecode(torch.nn.Module):
                 mask_2d = attention_mask.max(dim=0).values  # (total_q_len, total_k_len)
 
         # compute seqlens after compression
-        compressed_seqlens = torch.floor((seqlens_k - self.kernel_size) / self.kernel_stride) + 1
-        # corner case: if sequence_length < kernel_size, no compression for this sequence
-        compressed_seqlens[seqlens_k < self.kernel_size] = 0
-        compressed_seqlens = compressed_seqlens.to(torch.int32)
-        compressed_cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device="cuda"),
-                torch.cumsum(compressed_seqlens, dim=0),
-            ],
-            dim=0,
-        ).to(torch.int32)
+        with torch.profiler.record_function("FSA_decode.compress_layout"):
+            compressed_seqlens = torch.floor((seqlens_k - self.kernel_size) / self.kernel_stride) + 1
+            # corner case: if sequence_length < kernel_size, no compression for this sequence
+            compressed_seqlens[seqlens_k < self.kernel_size] = 0
+            compressed_seqlens = compressed_seqlens.to(torch.int32)
+            compressed_cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    torch.cumsum(compressed_seqlens, dim=0),
+                ],
+                dim=0,
+            ).to(torch.int32)
 
         # compressed key and value before rope
         # _linear_compress_decode 使用「未压缩」序列坐标：prev_total_len 为追加 k_new 前的原始 KV
@@ -142,123 +145,132 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         initial_buffer_k = k_cache[-buffer_size:] if buffer_size > 0 else None
         initial_buffer_v = v_cache[-buffer_size:] if buffer_size > 0 else None
 
-        # Decode the last part
-        decode_k_output = _linear_compress_decode(
-            k_new,
-            self.compress_key,
-            self.kernel_size,
-            self.kernel_stride,
-            self.intra_block_pe,
-            prev_raw_len,
-            initial_buffer_k,
-        )
+        with torch.profiler.record_function("FSA_decode.linear_compress"):
+            # Decode the last part
+            decode_k_output = _linear_compress_decode(
+                k_new,
+                self.compress_key,
+                self.kernel_size,
+                self.kernel_stride,
+                self.intra_block_pe,
+                prev_raw_len,
+                initial_buffer_k,
+            )
 
-        decode_v_output = _linear_compress_decode(
-            v_new,
-            self.compress_value,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-            prev_raw_len,
-            initial_buffer_v,
-        )
-        # Combine results
-        if decode_k_output is not None:
-            compressed_k = torch.cat([cmp_k_cache, decode_k_output], dim=0)
-            compressed_v = torch.cat([cmp_v_cache, decode_v_output], dim=0)
-        else:
-            compressed_k = cmp_k_cache
-            compressed_v = cmp_v_cache
+            decode_v_output = _linear_compress_decode(
+                v_new,
+                self.compress_value,
+                self.kernel_size,
+                self.kernel_stride,
+                None,
+                prev_raw_len,
+                initial_buffer_v,
+            )
+            # Combine results
+            if decode_k_output is not None:
+                compressed_k = torch.cat([cmp_k_cache, decode_k_output], dim=0)
+                compressed_v = torch.cat([cmp_v_cache, decode_v_output], dim=0)
+            else:
+                compressed_k = cmp_k_cache
+                compressed_v = cmp_v_cache
 
         # Build compressed_mask from full attention_mask when present (for tree decoding)
         # compressed_mask[q, c] = 1 iff any key in block c is visible to q (1=attend, 0=mask)
         attention_mask_compressed = None
         if attention_mask is not None:
-            total_q_len, total_k_len = q.shape[0], k.shape[0]
-            mask_2d = attention_mask if attention_mask.dim() == 2 else attention_mask.max(dim=0).values
-            compressed_k_len = compressed_k.shape[0]
-            # Block c covers uncompress indices [c*kernel_stride, c*kernel_stride+kernel_size)
-            compressed_mask = torch.zeros(
-                total_q_len, compressed_k_len, device=x.device, dtype=torch.float32
-            )
-            for c in range(compressed_k_len):
-                start = c * self.kernel_stride
-                end = min(start + self.kernel_size, mask_2d.shape[1])
-                compressed_mask[:, c] = mask_2d[:, start:end].to(torch.float32).amax(dim=1)
-            attention_mask_compressed = compressed_mask
+            with torch.profiler.record_function("FSA_decode.mask_compressed"):
+                total_q_len, total_k_len = q.shape[0], k.shape[0]
+                mask_2d = attention_mask if attention_mask.dim() == 2 else attention_mask.max(dim=0).values
+                compressed_k_len = compressed_k.shape[0]
+                # Block c covers uncompress indices [c*kernel_stride, c*kernel_stride+kernel_size)
+                compressed_mask = torch.zeros(
+                    total_q_len, compressed_k_len, device=x.device, dtype=torch.float32
+                )
+                for c in range(compressed_k_len):
+                    start = c * self.kernel_stride
+                    end = min(start + self.kernel_size, mask_2d.shape[1])
+                    compressed_mask[:, c] = mask_2d[:, start:end].to(torch.float32).amax(dim=1)
+                attention_mask_compressed = compressed_mask
 
         # do rope for query and compressed key
-        if position_ids is not None:
-            q = self.rope(q, cu_seqlens_q, position_ids=position_ids)
-        else:
-            q = self.rope(q, cu_seqlens_q)
-        # compressed_k uses compressed_cu_seqlens + (start,stride) scheme as before
-        compressed_k = self.rope(compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride)
+        with torch.profiler.record_function("FSA_decode.rope_q_cmpk"):
+            if position_ids is not None:
+                q = self.rope(q, cu_seqlens_q, position_ids=position_ids)
+            else:
+                q = self.rope(q, cu_seqlens_q)
+            # compressed_k uses compressed_cu_seqlens + (start,stride) scheme as before
+            compressed_k = self.rope(compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride)
 
         # attention between query and compressed key value
         compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
-        compressed_attn_output, topk_idx = _compressed_attention_decode(
-            q,
-            compressed_k,
-            compressed_v,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.topk,
-            cu_seqlens_q,
-            compressed_cu_seqlens,
-            max_seqlen_q,
-            compressed_seqlens.max().item(),
-            None,
-            self.init_blocks,
-            self.local_blocks,
-            query_start_index=k_cache.shape[0],
-            attention_mask=attention_mask_compressed,
-        )
+        with torch.profiler.record_function("FSA_decode.compressed_path"):
+            compressed_attn_output, topk_idx = _compressed_attention_decode(
+                q,
+                compressed_k,
+                compressed_v,
+                self.kernel_size,
+                self.kernel_stride,
+                self.block_size,
+                self.topk,
+                cu_seqlens_q,
+                compressed_cu_seqlens,
+                max_seqlen_q,
+                compressed_seqlens.max().item(),
+                None,
+                self.init_blocks,
+                self.local_blocks,
+                query_start_index=k_cache.shape[0],
+                attention_mask=attention_mask_compressed,
+            )
 
         # do rope for original key
-        if position_ids is not None:
-            # apply RoPE only to new keys with explicit positions, keep cached part as-is
-            new_pos = position_ids
-            k_new_rope = self.rope(k_new, cu_seqlens_q, position_ids=new_pos)
-            k = torch.cat([k_cache, k_new_rope], dim=0)
-        else:
-            k = self.rope(k, cu_seqlens_k)
+        with torch.profiler.record_function("FSA_decode.rope_full_k"):
+            if position_ids is not None:
+                # apply RoPE only to new keys with explicit positions, keep cached part as-is
+                new_pos = position_ids
+                k_new_rope = self.rope(k_new, cu_seqlens_q, position_ids=new_pos)
+                k = torch.cat([k_cache, k_new_rope], dim=0)
+            else:
+                k = self.rope(k, cu_seqlens_k)
 
         # topk sparse attention
-        sparse_attn_output = _topk_sparse_attention_decode(
-            q, k, v, topk_idx, self.block_size,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            seqlens_k.max().item(),
-            None,
-            attention_mask=attention_mask,
-        )
+        with torch.profiler.record_function("FSA_decode.topk_sparse_path"):
+            sparse_attn_output = _topk_sparse_attention_decode(
+                q, k, v, topk_idx, self.block_size,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                seqlens_k.max().item(),
+                None,
+                attention_mask=attention_mask,
+            )
 
         # sliding window attention (flash_attn does not support custom mask; sliding branch never applies attention_mask)
-        sliding_attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            seqlens_k.max().item(),
-            causal=False,
-            window_size=(self.window_size, -1),
-        )
+        with torch.profiler.record_function("FSA_decode.sliding_flash_path"):
+            sliding_attn_output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                seqlens_k.max().item(),
+                causal=False,
+                window_size=(self.window_size, -1),
+            )
 
-        # gate average
-        gate = self.gate(x)
-        attn_output = (
-            gate[:, 0:1, None] * compressed_attn_output
-            + gate[:, 1:2, None] * sparse_attn_output
-            + gate[:, 2:3, None] * sliding_attn_output
-        )
+        # gate + three-branch fusion
+        with torch.profiler.record_function("FSA_decode.gate_and_fuse"):
+            gate = self.gate(x)
+            attn_output = (
+                gate[:, 0:1, None] * compressed_attn_output
+                + gate[:, 1:2, None] * sparse_attn_output
+                + gate[:, 2:3, None] * sliding_attn_output
+            )
 
         # rearrange and output proj
-        attn_output = rearrange(attn_output, "n h d -> n (h d)")
-        attn_output = self.proj_o(attn_output)
+        with torch.profiler.record_function("FSA_decode.proj_o"):
+            attn_output = rearrange(attn_output, "n h d -> n (h d)")
+            attn_output = self.proj_o(attn_output)
 
         return attn_output

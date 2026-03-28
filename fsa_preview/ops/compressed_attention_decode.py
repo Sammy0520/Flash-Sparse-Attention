@@ -162,33 +162,11 @@ def _compressed_attention_decode(
     if sm_scale is None:
         sm_scale = 1 / math.sqrt(q.shape[-1])
 
-    attn_output, lse = _compressed_attention_fwd_decode(
-        q,
-        k,
-        v,
-        kernel_size,
-        kernel_stride,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        sm_scale,
-        query_start_index,
-        attention_mask=attention_mask,
-    )
-
-    # do not select topk index
-    if topk <= 0:
-        warnings.warn("topk <= 0, returned topk_idx will be None")
-        return attn_output, None
-
-    assert topk >= init_blocks + local_blocks
-    with torch.no_grad():
-        # with cuda_timer("score kernels"):
-        score = _get_attention_score_decode(
+    with torch.profiler.record_function("FSA_decode.compressed.fwd_attn"):
+        attn_output, lse = _compressed_attention_fwd_decode(
             q,
             k,
-            lse,
+            v,
             kernel_size,
             kernel_stride,
             cu_seqlens_q,
@@ -197,9 +175,32 @@ def _compressed_attention_decode(
             max_seqlen_k,
             sm_scale,
             query_start_index,
+            attention_mask=attention_mask,
         )
-        # transform score to block-wise score
-        score = transform_score_decode(
+
+    # do not select topk index
+    if topk <= 0:
+        warnings.warn("topk <= 0, returned topk_idx will be None")
+        return attn_output, None
+
+    assert topk >= init_blocks + local_blocks
+    with torch.no_grad():
+        with torch.profiler.record_function("FSA_decode.compressed.score"):
+            score = _get_attention_score_decode(
+                q,
+                k,
+                lse,
+                kernel_size,
+                kernel_stride,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                sm_scale,
+                query_start_index,
+            )
+        with torch.profiler.record_function("FSA_decode.compressed.transform_score"):
+            score = transform_score_decode(
                 score,
                 kernel_size,
                 kernel_stride,
@@ -212,10 +213,10 @@ def _compressed_attention_decode(
                 local_blocks,
             )
 
-        # get topk
-        topk = min(topk, score.shape[-1])
-        topk_idx = score.topk(topk, dim=-1).indices
-        topk_idx = topk_idx.to(torch.int32)
+        with torch.profiler.record_function("FSA_decode.compressed.block_topk"):
+            topk = min(topk, score.shape[-1])
+            topk_idx = score.topk(topk, dim=-1).indices
+            topk_idx = topk_idx.to(torch.int32)
 
     return attn_output, topk_idx
 
