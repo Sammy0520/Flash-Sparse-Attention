@@ -1,0 +1,97 @@
+========================================================================
+FSA decode — full forward profile
+  seqlen=131072 q_len=8 hidden=4096 Hq=8 Hkv=8 D=128 dtype=bfloat16
+  kv/cmp: preallocated buffers (A1/A2 — no torch.cat for kv_cat / cmp append)
+========================================================================
+
+[Full forward] avg 2.9257 ms/iter  (CUDA events, 20 iters)
+  output shape: (8, 4096)
+
+[Profiler] top 40 by CUDA self time (sum over 5 forwards):
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                 FSA_decode.rope_full_k         0.00%       0.000us         0.00%       0.000us       0.000us       4.845ms        19.57%       4.845ms     968.920us             5  
+                                 FSA_decode.rope_q_cmpk         0.00%       0.000us         0.00%       0.000us       0.000us       3.919ms        15.84%       3.919ms     783.868us             5  
+                             FSA_decode.linear_compress         0.00%       0.000us         0.00%       0.000us       0.000us       2.454ms         9.91%       2.454ms     490.764us             5  
+                                         ApplyRotaryEmb         4.81%     962.346us         7.42%       1.484ms      98.913us       2.292ms         9.26%       2.861ms     190.731us            15  
+                                          rotary_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       2.292ms         9.26%       2.292ms     152.783us            15  
+                                            aten::copy_         2.68%     535.596us         5.39%       1.078ms       7.984us       1.165ms         4.71%       1.165ms       8.632us           135  
+                         FSA_decode.compressed.fwd_attn         0.00%       0.000us         0.00%       0.000us       0.000us       1.143ms         4.62%       1.143ms     228.598us             5  
+                             FSA_decode.compress_layout         0.00%       0.000us         0.00%       0.000us       0.000us       1.082ms         4.37%       1.082ms     216.457us             5  
+                  FSA_decode.compressed.transform_score         0.00%       0.000us         0.00%       0.000us       0.000us       1.019ms         4.12%       1.019ms     203.772us             5  
+                          FSA_decode.sliding_flash_path         0.00%       0.000us         0.00%       0.000us       0.000us     807.690us         3.26%     807.690us     161.538us             5  
+                            FSA_decode.topk_sparse_path         0.00%       0.000us         0.00%       0.000us       0.000us     683.401us         2.76%     683.401us     136.680us             5  
+                               FSA_decode.gate_and_fuse         0.00%       0.000us         0.00%       0.000us       0.000us     607.305us         2.45%     607.305us     121.461us             5  
+                             linear_compress_fwd_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     586.407us         2.37%     586.407us      58.641us            10  
+                                  forward_kernel_decode         0.00%       0.000us         0.00%       0.000us       0.000us     585.479us         2.37%     585.479us     117.096us             5  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     569.222us         2.30%     569.222us      18.974us            30  
+                                               aten::mm         1.86%     371.817us         2.80%     560.507us      22.420us     499.335us         2.02%     499.335us      19.973us            25  
+                                              aten::mul         1.51%     302.041us         2.25%     450.603us      10.013us     474.917us         1.92%     474.917us      10.554us            45  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     454.886us         1.84%     454.886us      15.163us            30  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     421.541us         1.70%     421.541us      14.051us            30  
+                                    FSA_decode.qkv_proj         0.00%       0.000us         0.00%       0.000us       0.000us     355.459us         1.44%     355.459us      71.092us             5  
+void gemmSN_TN_kernel<float, 128, 16, 2, 4, 8, 9, fa...         0.00%       0.000us         0.00%       0.000us       0.000us     259.204us         1.05%     259.204us      51.841us             5  
+GeneratedBackwardFor_flash_attn__flash_attn_varlen_f...         1.34%     268.857us         1.91%     382.961us      76.592us     231.812us         0.94%     231.812us      46.362us             5  
+void flash::flash_fwd_kernel<Flash_fwd_kernel_traits...         0.00%       0.000us         0.00%       0.000us       0.000us     231.812us         0.94%     231.812us      46.362us             5  
+                                              aten::sin         0.45%      89.556us         0.71%     141.875us       9.458us     226.625us         0.92%     226.625us      15.108us            15  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     226.625us         0.92%     226.625us      15.108us            15  
+                                              aten::cos         0.53%     106.158us         0.80%     160.915us      10.728us     194.179us         0.78%     194.179us      12.945us            15  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     194.179us         0.78%     194.179us      12.945us            15  
+                       FSA_decode.compressed.block_topk         0.00%       0.000us         0.00%       0.000us       0.000us     184.130us         0.74%     184.130us      36.826us             5  
+                                              aten::bmm         2.09%     418.710us         2.66%     531.237us      26.562us     177.249us         0.72%     177.249us       8.862us            20  
+void cutlass::Kernel<cutlass_80_tensorop_s16816gemm_...         0.00%       0.000us         0.00%       0.000us       0.000us     153.506us         0.62%     153.506us      10.234us            15  
+                                              aten::max         1.70%     339.730us         3.26%     651.314us      14.474us     148.002us         0.60%     148.002us       3.289us            45  
+                                    forward_kernel_orig         0.00%       0.000us         0.00%       0.000us       0.000us     119.584us         0.48%     119.584us      23.917us             5  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     116.801us         0.47%     116.801us       3.337us            35  
+                                      FSA_decode.kv_cat         0.00%       0.000us         0.00%       0.000us       0.000us     116.739us         0.47%     116.739us      23.348us             5  
+sm80_xmma_gemm_f32f32_f32f32_f32_nn_n_tilesize64x64x...         0.00%       0.000us         0.00%       0.000us       0.000us      96.225us         0.39%      96.225us      19.245us             5  
+                              aten::_local_scalar_dense         0.94%     188.175us        17.23%       3.446ms      57.433us      85.633us         0.35%      85.633us       1.427us            60  
+                         Memcpy DtoH (Device -> Pinned)         0.00%       0.000us         0.00%       0.000us       0.000us      85.633us         0.35%      85.633us       1.557us            55  
+                                             aten::topk         0.46%      92.686us         0.86%     172.451us      34.490us      81.218us         0.33%      81.218us      16.244us             5  
+                                            aten::fill_         0.83%     166.480us         1.72%     344.346us       6.887us      72.160us         0.29%      72.160us       1.443us            50  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      71.329us         0.29%      71.329us       2.378us            30  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 20.005ms
+Self CUDA time total: 24.749ms
+
+
+========================================================================
+[Forward — sequential scopes] CUDA inclusive ms per forward, ~5 forwards in window:
+  compress_layout (compressed_seqlens + compressed_cu_seqlens): 0.2165 ms
+  qkv_proj (Linear q/k/v + view): 0.0711 ms
+  kv_cat (concat k/v cache with new tokens): 0.0233 ms
+  linear_compress (_linear_compress_decode K/V + cat cmp_*): 0.4908 ms
+  mask_compressed (mask → compressed_mask; only if attention_mask): (skipped — no attention_mask; use --attention-mask to profile)
+  rope_q_cmpk (RoPE on q + compressed_k): 0.7839 ms
+  compressed_path (_compressed_attention_decode): 0.0124 ms
+  rope_full_k (RoPE on full k): 0.9689 ms
+  topk_sparse_path: 0.1367 ms
+  sliding_flash_path (flash_attn varlen): 0.1615 ms
+  gate_and_fuse (gate + 3-way weighted sum): 0.1215 ms
+  proj_o (rearrange + Linear out): 0.0110 ms
+  --- share of sum(all stages above) ---
+    compress_layout … 7.2%
+    qkv_proj … 2.4%
+    kv_cat … 0.8%
+    linear_compress … 16.4%
+    rope_q_cmpk … 26.2%
+    compressed_path … 0.4%
+    rope_full_k … 32.3%
+    topk_sparse_path … 4.6%
+    sliding_flash_path … 5.4%
+    gate_and_fuse … 4.1%
+    proj_o … 0.4%
+  stages sum: 2.9975 ms  |  [Full forward] CUDA event: 2.9257 ms  |  差值多为未打标片段（如 .item() 同步、assert 路径）与 profiler 口径差异
+
+[Compressed path breakdown] inclusive ms per forward (nested under compressed_path):
+  fwd: Q×compressed_KV attention (forward_kernel_decode): 0.2286 ms
+  score: per-token score from q,k,lse (score_kernel_decode): 0.0118 ms
+  transform: token score → block score (_transform_score_kernel + setup): 0.2038 ms
+  block_topk: aten::topk + int32 cast: 0.0368 ms
+  (四段之和 0.4810 ms，应与上行 compressed_path 接近)
+========================================================================
+
+Tip: 上表为顺序 scope 的 inclusive CUDA；详表 topN 按 self_cuda。
+     Chrome: --export-chrome trace.json → chrome://tracing
+========================================================================

@@ -9,6 +9,10 @@ Usage:
   cd Flash-Sparse-Attention
   PYTHONPATH=. python test/profile_fsa_decode_forward.py --q-len 8 --seqlen 131072
   PYTHONPATH=. python test/profile_fsa_decode_forward.py --q-len 8 --seqlen 131072 --attention-mask
+
+Under nsys (avoid CUPTI conflict with torch.profiler — only CUDA Event + .nsys-rep timeline):
+  nsys profile --trace=cuda,nvtx,osrt --output=bench_logs/nsys.nsys-rep -- \\
+    python test/profile_fsa_decode_forward.py --q-len 8 --seqlen 131072 --no-torch-profiler
   PYTHONPATH=. python test/profile_fsa_decode_forward.py --q-len 8 --seqlen 4096 --export-chrome trace.json
 
 Requires CUDA. Matches tensor layout pattern from test/test_FSA_decode.py.
@@ -47,7 +51,9 @@ def _branch_ms_per_forward(prof, key: str, profile_runs: int, ev_avg) -> float:
     for e in prof.events():
         if getattr(e, "name", None) != key:
             continue
-        u = getattr(e, "cuda_time_total", None)
+        u = getattr(e, "device_time_total", None)
+        if u is None:
+            u = getattr(e, "cuda_time_total", None)
         if u is None:
             u = getattr(e, "self_cuda_time_total", None)
         if u is None:
@@ -76,7 +82,13 @@ def build_module_and_inputs(
     dtype: torch.dtype,
     device: str,
     attention_mask: bool = False,
+    inplace_kv_cmp_buffers: bool = False,
+    return_state: bool = False,
 ):
+    """
+    When ``return_state`` is True, the return value includes an extra ``dict`` of tensors
+    (``kv_*`` / ``cmp_s*`` only if ``inplace_kv_cmp_buffers``).
+    """
     sparse_attn = (
         FlashSparseAttentionDecode(
             hidden_size=hidden_size,
@@ -141,7 +153,7 @@ def build_module_and_inputs(
         # Exercises FSA_decode.mask_compressed (Python loop); values all 1 → no masking effect.
         am = torch.ones(q_len, seqlen, device=device, dtype=torch.float32)
 
-    def run_forward():
+    def run_forward_legacy():
         return sparse_attn(
             x,
             cu_seqlens_q,
@@ -153,7 +165,73 @@ def build_module_and_inputs(
             attention_mask=am,
         )
 
-    return sparse_attn, run_forward
+    if not inplace_kv_cmp_buffers:
+        if return_state:
+            st = {
+                "k_cache": k_cache,
+                "v_cache": v_cache,
+                "cmp_k_cache": cmp_k_cache,
+                "cmp_v_cache": cmp_v_cache,
+                "cu_seqlens_k": cu_seqlens_k,
+                "x": x,
+                "cu_seqlens_q": cu_seqlens_q,
+                "q_len": q_len,
+            }
+            return sparse_attn, run_forward_legacy, st
+        return sparse_attn, run_forward_legacy
+
+    # A1/A2: preallocated KV + compressed buffers (append via copy_, no torch.cat)
+    past = seqlen - 1
+    raw_total = past + q_len
+    kv_k = torch.empty(raw_total, kv_heads, head_dim, device=device, dtype=dtype)
+    kv_v = torch.empty(raw_total, kv_heads, head_dim, device=device, dtype=dtype)
+    kv_k[:past].copy_(k_cache)
+    kv_v[:past].copy_(v_cache)
+
+    cmp_past = cmp_k_cache.shape[0]
+    cmp_cap = cmp_past + q_len + kernel_size
+    cmp_sk = torch.empty(cmp_cap, kv_heads, head_dim, device=device, dtype=dtype)
+    cmp_sv = torch.empty(cmp_cap, kv_heads, head_dim, device=device, dtype=dtype)
+    cmp_sk[:cmp_past].copy_(cmp_k_cache)
+    cmp_sv[:cmp_past].copy_(cmp_v_cache)
+
+    def run_forward_inplace():
+        return sparse_attn(
+            x,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            None,
+            None,
+            attention_mask=am,
+            kv_storage_k=kv_k,
+            kv_storage_v=kv_v,
+            kv_past_len=past,
+            cmp_storage_k=cmp_sk,
+            cmp_storage_v=cmp_sv,
+            cmp_past_len=cmp_past,
+        )
+
+    if return_state:
+        st = {
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "cmp_k_cache": cmp_k_cache,
+            "cmp_v_cache": cmp_v_cache,
+            "cu_seqlens_k": cu_seqlens_k,
+            "x": x,
+            "cu_seqlens_q": cu_seqlens_q,
+            "q_len": q_len,
+            "kv_k": kv_k,
+            "kv_v": kv_v,
+            "cmp_sk": cmp_sk,
+            "cmp_sv": cmp_sv,
+            "kv_past_init": past,
+            "cmp_past_init": cmp_past,
+        }
+        return sparse_attn, run_forward_inplace, run_forward_legacy, st
+    return sparse_attn, run_forward_inplace, run_forward_legacy
 
 
 def main():
@@ -179,6 +257,21 @@ def main():
         action="store_true",
         help="Pass a dense (q_len, seqlen) all-ones mask to profile mask→compressed_mask Python loop",
     )
+    p.add_argument(
+        "--no-torch-profiler",
+        action="store_true",
+        help="Skip torch.profiler block; use when wrapping with nsys to avoid CUPTI multiple subscribers",
+    )
+    p.add_argument(
+        "--inplace-kv-cmp-buffers",
+        action="store_true",
+        help="Use preallocated kv_storage_* / cmp_storage_* (A1/A2: avoid O(seq) cat on this step)",
+    )
+    p.add_argument(
+        "--verify-inplace",
+        action="store_true",
+        help="Run one legacy vs inplace forward and assert outputs close (requires --inplace-kv-cmp-buffers path built separately)",
+    )
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -187,7 +280,7 @@ def main():
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     device = "cuda"
 
-    sparse_attn, run_forward = build_module_and_inputs(
+    _built = build_module_and_inputs(
         seqlen=args.seqlen,
         q_len=args.q_len,
         hidden_size=args.hidden_size,
@@ -201,7 +294,22 @@ def main():
         dtype=dtype,
         device=device,
         attention_mask=args.attention_mask,
+        inplace_kv_cmp_buffers=args.inplace_kv_cmp_buffers,
     )
+    if args.inplace_kv_cmp_buffers:
+        sparse_attn, run_forward, run_forward_legacy = _built
+    else:
+        sparse_attn, run_forward = _built
+
+    if args.verify_inplace:
+        if not args.inplace_kv_cmp_buffers:
+            raise SystemExit("--verify-inplace requires --inplace-kv-cmp-buffers")
+        torch.cuda.synchronize()
+        y0 = run_forward_legacy()
+        y1 = run_forward()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y0, y1, rtol=2e-2, atol=2e-2, check_stride=False)
+        print("[verify-inplace] legacy vs preallocated buffers: OK (assert_close)")
 
     print("=" * 72)
     print("FSA decode — full forward profile")
@@ -211,6 +319,8 @@ def main():
     )
     if args.attention_mask:
         print("  attention_mask: dense all-ones (q_len × seqlen) — profiles mask_compressed path")
+    if args.inplace_kv_cmp_buffers:
+        print("  kv/cmp: preallocated buffers (A1/A2 — no torch.cat for kv_cat / cmp append)")
     print("=" * 72)
 
     for _ in range(args.warmup):
@@ -228,6 +338,16 @@ def main():
     ms = ev0.elapsed_time(ev1) / args.bench_iters
     print(f"\n[Full forward] avg {ms:.4f} ms/iter  (CUDA events, {args.bench_iters} iters)")
     print(f"  output shape: {tuple(out.shape)}")
+
+    if args.no_torch_profiler:
+        print(
+            "\n[Note] 已跳过 torch.profiler（--no-torch-profiler）。"
+            "与 nsys 同时开 CUDA trace 时 CUPTI 只能有一方订阅，否则 GPU 计时会丢。"
+            "\n  数值 baseline：以本段 [Full forward] CUDA Event 为准；"
+            "时间线：用本次生成的 .nsys-rep 在 Nsight Systems 里看。"
+        )
+        print("=" * 72)
+        return
 
     # --- torch.profiler ---
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
