@@ -16,7 +16,6 @@ def benchmark():
     block_size = 64
     topk = 16
     window_size = 512
-    cfactor = 4
     
     num_k_blocks = context_len // block_size
 
@@ -64,33 +63,39 @@ def benchmark():
     # -----------------------------------------------------------
     # 预热
     for _ in range(10):
-        _ = _unified_sparse_attention_decode(q, k, v, topk_idx, block_size, window_size, cu_seqlens_q, cu_seqlens_k, total_q_len, context_len, gate, CFACTOR=cfactor)
+        _ = _unified_sparse_attention_decode(q, k, v, topk_idx, block_size, window_size, cu_seqlens_q, cu_seqlens_k, total_q_len, context_len, gate)
 
     start_event.record()
     for _ in range(100):
         unified_output = _unified_sparse_attention_decode(
             q, k, v, topk_idx, block_size, window_size,
             cu_seqlens_q, cu_seqlens_k, total_q_len, context_len,
-            gate, CFACTOR=cfactor
+            gate
         )
     end_event.record()
     torch.cuda.synchronize()
     unified_ms = start_event.elapsed_time(end_event) / 100
 
-    # abs_diff = (baseline_output - unified_output).abs().mean().item()
-    # rel_diff = (baseline_output - unified_output).abs().mean().item() / baseline_output.abs().mean().item()
+    abs_diff = (baseline_output - unified_output).abs().mean().item()
+    rel_diff = (baseline_output - unified_output).abs().mean().item() / baseline_output.abs().mean().item()
+    # print(baseline_output)
+    # print(unified_output)
     
     print(f"--- Benchmark Results (Context: {context_len//1024}k) ---")
+    print("q shape:", q.shape)
+    print("k shape:", k.shape)
+    print("v shape:", v.shape)
+    print("topk:", topk)
     print(f"Baseline Latency: {baseline_ms:.4f} ms")
     print(f"Unified Latency:  {unified_ms:.4f} ms")
     print(f"Speedup:          {baseline_ms / unified_ms:.2f}x")
-    # print(f"Mean Abs Diff:    {abs_diff:.6f}")
-    # print(f"Mean Rel Diff:    {rel_diff:.6f}")
+    print(f"Mean Abs Diff:    {abs_diff:.6f}")
+    print(f"Mean Rel Diff:    {rel_diff:.6f}")
     
-    # if rel_diff < 1e-2:
-    #     print("SUCCESS: Unified output matches Baseline closely.")
-    # else:
-    #     print("WARNING: Large numerical difference. Check Softmax normalization logic.")
+    if rel_diff < 1e-2:
+        print("SUCCESS: Unified output matches Baseline closely.")
+    else:
+        print("WARNING: Large numerical difference. Check Softmax normalization logic.")
 
 if __name__ == "__main__":
     benchmark()
