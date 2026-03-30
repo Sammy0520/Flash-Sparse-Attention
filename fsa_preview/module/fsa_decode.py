@@ -6,6 +6,7 @@ from flash_attn import flash_attn_varlen_func
 from fsa_preview.ops import (_compressed_attention_decode,
                              _linear_compress_decode,
                              _topk_sparse_attention_decode)
+from fsa_preview.ops.unified_sparse_attention_decode import _unified_sparse_attention_decode
 from nsa_ref.module.rope import RopeConfig, RotaryEmbedding
 
 
@@ -225,36 +226,28 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         else:
             k = self.rope(k, cu_seqlens_k)
 
-        # topk sparse attention
-        sparse_attn_output = _topk_sparse_attention_decode(
-            q, k, v, topk_idx, self.block_size,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            seqlens_k.max().item(),
-            None,
-            attention_mask=attention_mask,
-        )
+        # compute gate
+        gate = self.gate(x)
 
-        # sliding window attention (flash_attn does not support custom mask; sliding branch never applies attention_mask)
-        sliding_attn_output = flash_attn_varlen_func(
+        # topk sparse attention and sliding window attention
+        unified_attn_output = _unified_sparse_attention_decode(
             q,
             k,
             v,
+            topk_idx,
+            self.block_size,
+            self.window_size,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
             seqlens_k.max().item(),
-            causal=False,
-            window_size=(self.window_size, -1),
+            gate,
+            causal=True,
         )
 
-        # gate average
-        gate = self.gate(x)
         attn_output = (
             gate[:, 0:1, None] * compressed_attn_output
-            + gate[:, 1:2, None] * sparse_attn_output
-            + gate[:, 2:3, None] * sliding_attn_output
+            + unified_attn_output
         )
 
         # rearrange and output proj
