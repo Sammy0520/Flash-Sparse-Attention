@@ -94,21 +94,12 @@ def forward_kernel_orig(
             off_t = tl.arange(0, BLOCK_SIZE_T)
             t_ptr_j = t_ptr + (q_start + pid_q_j) * stride_tn + pid_kh * stride_th
             topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < TOPK, other=-1)
-
-            """Removed causal attention, which should be:
+            abs_q_pos = k_len - q_len + pid_q_j
+            max_valid_block_idx = abs_q_pos // BLOCK_SIZE_K
             real_topk = tl.sum(
-                tl.where((topk_idx >= 0) & (topk_idx <= pid_q_j // block_size), 1, 0),
+                tl.where((topk_idx >= 0) & (topk_idx <= max_valid_block_idx), 1, 0),
                 axis=0,
             )
-            """
-            real_topk = tl.sum(
-                tl.where((topk_idx >= 0) & (topk_idx < 2147483647), 1, 0),
-                axis=0,
-            )
-            # real_topk = tl.sum(
-            #     tl.where((topk_idx >= 0) & (topk_idx <= pid_q_j // block_size), 1, 0),
-            #     axis=0,
-            # )
             # init qkv pointer
             q_ptrs = tl.make_block_ptr(
                 base=q_ptr + (q_start + pid_q_j) * stride_qn + pid_h * stride_qh,
@@ -151,7 +142,7 @@ def forward_kernel_orig(
                 k = tl.load(tl.advance(k_ptrs, (0, c)), boundary_check=(1, 0), padding_option="zero")
                 # compute qk
                 qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-                #qk += tl.where((pid_q_j >= c + off_k)[None, :], 0, float("-inf"))
+                qk += tl.where((k_len - q_len + pid_q_j >= c + off_k)[None, :], 0.0, float("-inf"))
                 # [BLOCK_SIZE_H, HEAD_DIM] @ [HEAD_DIM, BLOCK_SIZE_K] -> [BLOCK_SIZE_H, BLOCK_SIZE_K]
                 qk += tl.dot(q, k) * qk_scale
                 # optional tree/custom mask: 1=attend, 0=mask

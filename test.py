@@ -35,7 +35,7 @@ def benchmark():
     # 预热
     for _ in range(10):
         _ = _topk_sparse_attention_decode(q, k, v, topk_idx, block_size, cu_seqlens_q, cu_seqlens_k, total_q_len, context_len)
-        _ = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, total_q_len, context_len, causal=False, window_size=(window_size, -1))
+        _ = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, total_q_len, context_len, causal=True, window_size=(window_size, -1))
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -50,7 +50,7 @@ def benchmark():
         # Branch 2: Sliding Window
         out_sliding = flash_attn_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, 
-            total_q_len, context_len, causal=False, window_size=(window_size, -1)
+            total_q_len, context_len, causal=True, window_size=(window_size, -1)
         )
         # Combine (只比较这两路)
         baseline_output = gate[:, 1:2, None] * out_sparse + gate[:, 2:3, None] * out_sliding

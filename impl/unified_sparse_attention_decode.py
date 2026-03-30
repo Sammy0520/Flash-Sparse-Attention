@@ -41,6 +41,7 @@ def forward_kernel_unified(
     stride_aql, stride_akl, # attention_mask_ptr, [total_q_len, total_k_len]
 
     # meta parameters
+    causal: tl.constexpr,
     block_size_k: tl.constexpr,
     head_dim: tl.constexpr,
     num_share_q_heads: tl.constexpr, # num_q_heads // num_k_heads
@@ -68,6 +69,7 @@ def forward_kernel_unified(
  
     BLOCK_H: tl.constexpr = num_share_q_heads if num_share_q_heads >= 16 else 16
     pid_q_start_abs = q_start + pid_seq_q_start # [0, total_q_len)
+    abs_q_pos = k_len - q_len + pid_seq_q_start
  
     # common offsets
     offs_h = tl.arange(0, BLOCK_H)
@@ -91,7 +93,12 @@ def forward_kernel_unified(
         mask=offs_block_topk < topk,
         other=INT32_MAX,
     )
-    real_topk = tl.sum(tl.where((topk_vals >= 0) & (topk_vals < INT32_MAX), 1, 0), axis=0)
+
+    if causal:
+        max_valid_block_idx = abs_q_pos // block_size_k
+        real_topk = tl.sum(tl.where((topk_vals >= 0) & (topk_vals <= max_valid_block_idx), 1, 0), axis=0)
+    else:
+        real_topk = tl.sum(tl.where((topk_vals >= 0) & (topk_vals < INT32_MAX), 1, 0), axis=0)
  
     # TopK branch
     qk_scale = sm_scale * 1.44269504
@@ -123,6 +130,9 @@ def forward_kernel_unified(
         k = tl.load(tl.advance(k_ptrs_tk, (0, c)), boundary_check=(1, 0), padding_option="zero")
         qk = tl.dot(q, k) * qk_scale  # [BLOCK_H, block_size_k], log2 scale
  
+        if causal:
+            qk += tl.where(abs_q_pos >= (c + offs_k_blk)[None, :], 0.0, float('-inf'))
+
         if HAS_MASK:
             mask_ptrs = tl.make_block_ptr(
                 base=attention_mask_ptr,
@@ -190,6 +200,9 @@ def forward_kernel_unified(
         # Left boundary mask: k positions < n_min are masked out (affects first block only)
         k_local = c + offs_k_blk
         qk = qk + tl.where(k_local[None, :] >= n_min, 0.0, float('-inf'))
+
+        if causal:
+            qk += tl.where(abs_q_pos >= k_local[None, :], 0.0, float('-inf'))
  
         if HAS_MASK:
             mask_ptrs = tl.make_block_ptr(
@@ -246,6 +259,7 @@ def _unified_sparse_attention_decode(
     gate: torch.Tensor, # [total_q_len, 3], gate[:, 1:2] is for sparse topk branch, gate[:, 2:3] is for sliding window branch
     sm_scale: float = None,
     attention_mask: torch.Tensor = None, # [total_q_len, total_k_len]
+    causal: bool = True,
 ) -> torch.Tensor: # [total_q_len, num_q_heads, head_dim]
     """
     Unified sparse attention (topk + sliding window)
@@ -326,6 +340,7 @@ def _unified_sparse_attention_decode(
         stride_mask_q, stride_mask_k,
 
         # meta parameters
+        causal=causal,
         block_size_k=block_size,
         head_dim=head_dim,
         num_share_q_heads=num_share_q_heads,
