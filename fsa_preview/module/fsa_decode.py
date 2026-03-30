@@ -74,6 +74,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         attention_mask: torch.Tensor = None,
         position_ids: torch.Tensor = None,
         use_dedup: bool = False,
+        kv_commit_stash: list = None,
     ):
         """
         Args:
@@ -223,6 +224,9 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             new_pos = position_ids
             k_new_rope = self.rope(k_new, cu_seqlens_q, position_ids=new_pos)
             k = torch.cat([k_cache, k_new_rope], dim=0)
+            if kv_commit_stash is not None:
+                # Same tensors used in attention; for SD commit append [:commit_len] to k_raw/v_raw.
+                kv_commit_stash.append((k_new_rope.detach(), v_new.detach()))
         else:
             k = self.rope(k, cu_seqlens_k)
 
