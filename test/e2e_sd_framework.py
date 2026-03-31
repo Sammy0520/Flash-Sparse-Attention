@@ -756,7 +756,7 @@ def print_stats(name: str, stats: GenerationStats, text: str):
         print(f"  acceptance_rate       : {stats.acceptance_rate:.3f}")
         print(f"  avg_accept_len        : {stats.avg_accept_len:.3f}")
         print(f"  num_rounds            : {stats.num_rounds}")
-    print(f"  text (prefix)         : {text[:120]!r}")
+    print(f"  text (prefix)         : {text[:512]!r}")
 
 
 def main():
@@ -790,135 +790,7 @@ def main():
     parser.add_argument(
         "--prompt",
         default=(
-            "Title: Adaptive Optimization Architectures for Next-Generation Transformer Inference\n\n"
-            "Executive Summary: As the structural complexity of Large Language Models (LLMs) continues to scale, "
-            "the computational bottleneck has shifted from raw floating-point operations (FLOPs) to memory bandwidth "
-            "and real-time latency constraints. This document explores the synergistic integration of Speculative "
-            "Decoding and Native Sparse Attention (NSA) to achieve sub-millisecond per-token generation in "
-            "long-context scenarios.\n\n"
-            
-            "Section 1: The Mechanics of Speculative Decoding\n"
-            "Speculative decoding addresses the inherently sequential nature of autoregressive sampling. By employing "
-            "a lightweight 'draft' model—often a distilled version of the target transformer or a small n-gram "
-            "approximator—the system generates a sequence of potential tokens ($t_1, t_2, ..., t_k$) in a single "
-            "forward pass. The 'target' model then performs a batch verification. If the target model's output "
-            "distribution aligns with the draft's predictions under a specified rejection sampling threshold, "
-            "multiple tokens are accepted simultaneously. This effectively breaks the $O(N)$ dependency of "
-            "decoding, where $N$ is the sequence length, leading to theoretical speedups of 2x to 4x depending "
-            "on the draft model's hit rate.\n\n"
-            
-            "Section 2: Scaling Context with Native Sparse Attention\n"
-            "Standard self-attention mechanisms suffer from quadratic complexity, $O(L^2)$, making context windows "
-            "exceeding 128k tokens prohibitively expensive. Native Sparse Attention (NSA) optimizes this by "
-            "leveraging the observation that most tokens in a long sequence contribute minimally to the attention "
-            "score of a given query. By implementing a block-sparse or top-k selection strategy directly into the "
-            "CUDA kernels, NSA reduces the KV cache footprint and accelerates the Softmax computation. Unlike "
-            "post-hoc pruning, 'native' sparsity is integrated during the training or fine-tuning phase, ensuring "
-            "that the model learns to compress information into specific attention heads without losing 'needle-in-a-haystack' "
-            "retrieval capabilities.\n\n"
-            
-            "Section 3: Hardware-Aware Co-Design\n"
-            "The transition to sparse kernels requires specialized hardware handling. Modern GPUs benefit from "
-            "Tensor Cores that support structured sparsity, but unstructured sparsity often leads to lower "
-            "utilization. Therefore, the implementation of these algorithms must consider the L1/L2 cache "
-            "hierarchy and the overhead of asynchronous memory copies (cudaMemcpyAsync). When combined with "
-            "8-bit or 4-bit KV cache quantization (KVCQ), the system can maintain massive active contexts "
-            "on a single H100 or A100 node, providing a robust foundation for RAG (Retrieval-Augmented Generation) "
-            "and complex multi-step reasoning agents.\n\n"
-            
-            "Section 4: KV Cache Quantization and Memory Efficiency\n"
-            "KV cache has become the dominant memory consumer in long-context LLM inference. For a model with "
-            "70 billion parameters and a context length of 128k tokens, the full-precision KV cache can exceed "
-            "hundreds of gigabytes, making real-time deployment infeasible on standard hardware. Quantization "
-            "techniques such as INT8 and INT4 reduce memory usage by 75% and 87.5% respectively, while maintaining "
-            "nearly identical generation quality. Advanced quantization methods include per-channel scaling, "
-            "zero-point correction, and dynamic calibration to minimize accuracy degradation. When combined with "
-            "sparse attention, KV cache quantization enables 128k context windows to fit entirely within GPU "
-            "memory, eliminating slow CPU-GPU data transfers and enabling end-to-end low-latency inference.\n\n"
-            
-            "Section 5: Block-Sparse Attention Kernels\n"
-            "Native Sparse Attention relies on custom CUDA and Triton kernels that compute attention only over "
-            "a small subset of key-value pairs. Block-sparse patterns divide the sequence into fixed-length chunks "
-            "and compute attention within local blocks, global blocks, or sliding windows. This reduces complexity "
-            "from $O(L^2)$ to $O(L \\times B)$, where B is block size. Modern kernels support dynamic sparsity "
-            "adjustment based on input content, allowing the model to focus on critical tokens while ignoring "
-            "redundant information. These kernels are optimized for Tensor Core utilization, memory coalescing, "
-            "and shared memory buffering to maximize throughput on NVIDIA Hopper and Ada architectures.\n\n"
-            
-            "Section 6: Speculative Decoding Optimization Strategies\n"
-            "To maximize speculative decoding efficiency, the draft model must be lightweight yet accurate. "
-            "Common designs include 10x smaller transformers, n-gram statistical models, or recurrent networks. "
-            "Higher draft hit rates reduce verification overhead and increase effective generation speed. "
-            "Advanced strategies include multi-level speculation, parallel draft generation, and adaptive "
-            "look-ahead lengths. When integrated with sparse attention, speculation can be applied to sparse "
-            "token subsets, further reducing compute and latency. Real-world deployments show 3x–5x speedups "
-            "in long documents, dialogue systems, and real-time agents.\n\n"
-            
-            "Section 7: Long-Context Understanding and Retrieval\n"
-            "LLMs with 128k+ context windows excel at document-level understanding, legal analysis, code "
-            "base comprehension, and multi-turn dialogue. However, full self-attention remains infeasible "
-            "without sparsity. Native Sparse Attention preserves critical long-range dependencies such as "
-            "entity tracking, cross-reference resolution, and topic continuity. When combined with RAG systems, "
-            "sparse models can retrieve and reason over millions of tokens in real time. This enables "
-            "enterprise-grade applications including contract analysis, code debugging, literature review, "
-            "and personalized AI assistants.\n\n"
-            
-            "Section 8: Latency, Throughput, and Scalability Tradeoffs\n"
-            "Inference optimization requires balancing three metrics: per-token latency, batch throughput, "
-            "and memory scalability. Speculative decoding reduces latency but adds draft-model compute. "
-            "Sparse attention reduces memory but requires kernel optimization. Quantization improves memory "
-            "efficiency but may affect accuracy. Hardware-aware co-design ensures all components work in sync: "
-            "Tensor Core utilization, cache efficiency, asynchronous data movement, and dynamic batching. "
-            "Optimal systems achieve sub-millisecond latency, 1000+ tokens/sec throughput, and 128k+ context "
-            "on single-GPU servers.\n\n"
-            
-            "Section 9: Future Directions for LLM Inference\n"
-            "Next-generation inference will combine sparsity, speculation, quantization, and hardware co-design. "
-            "Emerging techniques include continuous token streaming, dynamic context compression, hierarchical "
-            "attention, and model distillation for target-specific acceleration. Specialized AI accelerators "
-            "will natively support sparse and quantized operators, enabling 1M+ token contexts at interactive "
-            "speeds. Ultimately, these advances will enable real-time, human-like AI interaction across "
-            "every domain of technology and industry.\n\n"
-            
-            "Conclusion: The convergence of algorithmic speculative execution and structural attention sparsity "
-            "represents the most viable path toward achieving human-parity interaction speeds in artificial "
-            "intelligence, balancing the trade-offs between accuracy, throughput, and energy efficiency. "
-            "By unifying Native Sparse Attention, Speculative Decoding, KV Cache Quantization, and Hardware-Aware "
-            "Kernel Design, modern LLMs can efficiently scale to 128k token contexts and beyond. This architecture "
-            "powers next-generation applications including long-document understanding, real-time reasoning, "
-            "retrieval-augmented generation, and low-latency interactive AI systems. As models continue to grow, "
-            "these optimizations will remain essential for practical, efficient, and accessible deployment "
-            "across cloud, edge, and embedded environments. The future of transformer inference lies not in "
-            "unbounded scaling, but in intelligent, adaptive, and hardware-aware optimization that delivers "
-            "maximal performance with minimal resource cost. This paradigm shift ensures that large language "
-            "models can transition from research prototypes to reliable, real-world systems capable of "
-            "understanding, reasoning, and interacting at unprecedented scale and speed. "
-            
-            "This extended document provides comprehensive coverage of all core components required for "
-            "next-generation LLM inference systems, including detailed explanations of speculative decoding "
-            "mechanics, native sparse attention design, KV cache optimization, CUDA kernel engineering, "
-            "hardware co-design, quantization methods, long-context retrieval, latency tradeoffs, and "
-            "future research directions. It serves as a complete technical reference for building efficient, "
-            "scalable, and high-performance inference pipelines capable of supporting 128k token context "
-            "windows while maintaining sub-millisecond per-token generation speed. The content is structured "
-            "to support deep research, system implementation, and practical deployment in production-grade "
-            "AI environments. Every section is designed to reinforce the core message: adaptive, sparse, "
-            "speculative, and hardware-native optimizations are the foundation of next-generation AI systems. "
-            
-            "By integrating these principles into model architecture, inference engines, and low-level kernel "
-            "design, developers can unlock the full potential of large language models without compromising "
-            "speed, memory, or accuracy. This document stands as a complete blueprint for the future of "
-            "efficient, long-context, low-latency transformer inference. "
-            
-            " ".join(["The continuous advancement of LLM inference optimization ensures that models can scale "
-            "to extreme context lengths while remaining fast and efficient. Native Sparse Attention, Speculative "
-            "Decoding, and KV Cache Quantization together form a trifecta of modern acceleration techniques. "
-            "Each method addresses a critical bottleneck: memory usage, compute complexity, and sequential "
-            "decoding latency. When combined in a unified system, they enable 128k-token context windows "
-            "to run in real time on single GPUs. This breakthrough enables entirely new applications in "
-            "legal document analysis, software development, medical research, content creation, and intelligent "
-            "automation. As models evolve, these core optimizations will remain essential to making powerful "
-            "AI accessible and practical for everyone. " for _ in range(2800)])
+            "The afternoon sun filtered through the kitchen window, casting warm golden light on the wooden table. Clara stood by the counter, holding a mug of hot milk, watching her little cat curl up on the sofa. The cat, named Mochi, had soft white fur and a pair of bright blue eyes, looking like a fluffy snowball."
         ),
     )
     args = parser.parse_args()
