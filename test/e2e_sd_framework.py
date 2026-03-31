@@ -20,7 +20,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from nsa_ref.module import RopeConfig
 from nsa_ref.ops import linear_compress
 from fsa_preview.module.fsa_decode import FlashSparseAttentionDecode
+from fsa_preview.ops import _linear_compress_decode
 
 
 LLAMA_8B = (
@@ -253,9 +254,12 @@ class NSATargetModel:
         self.past_len = 0
         self._orig_forwards = {}
         self._verify_mode = False
+        self._hooks_patched = False
         self._pos_ids = None
         # Per-layer (k_new_rope, v_new) from the last verify forward; used for pure-NSA cache commit.
         self._stash_kv_new: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * len(nsa_layers)
+        # Reuse tiny cu tensors to avoid per-layer/per-round allocations.
+        self._cu_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
     def init_from_prefill(self, past_key_values):
         device = self.nsa_layers[0].fsa.proj_q.weight.device
@@ -296,11 +300,10 @@ class NSATargetModel:
     def commit_after_verify(self, commit_len: int):
         """
         Append committed raw KV from stashed NSA projections (same as inside FlashSparseAttentionDecode:
-        k_new after RoPE, v_new without extra RoPE), then rebuild cmp_k/cmp_v from full raw cache.
+        k_new after RoPE, v_new without extra RoPE), then incrementally append cmp_k/cmp_v.
         """
         if commit_len <= 0:
             return
-        device = self.nsa_layers[0].fsa.proj_q.weight.device
         dtype = self.k_raw[0].dtype
         for l, nsa in enumerate(self.nsa_layers):
             st = self._stash_kv_new[l]
@@ -309,12 +312,35 @@ class NSATargetModel:
             k_new_rope, v_new = st
             kn = k_new_rope[:commit_len].contiguous().to(dtype)
             vn = v_new[:commit_len].contiguous().to(dtype)
+            prev_raw_len = self.k_raw[l].shape[0]
+            buffer_size = min(nsa.kernel_size - 1, prev_raw_len)
+            init_buf_k = self.k_raw[l][-buffer_size:] if buffer_size > 0 else None
+            init_buf_v = self.v_raw[l][-buffer_size:] if buffer_size > 0 else None
+
+            decode_k = _linear_compress_decode(
+                kn,
+                nsa.fsa.compress_key,
+                nsa.kernel_size,
+                nsa.kernel_stride,
+                nsa.fsa.intra_block_pe,
+                prev_raw_len,
+                init_buf_k,
+            )
+            decode_v = _linear_compress_decode(
+                vn,
+                nsa.fsa.compress_value,
+                nsa.kernel_size,
+                nsa.kernel_stride,
+                None,
+                prev_raw_len,
+                init_buf_v,
+            )
+            if decode_k is not None:
+                self.cmp_k[l] = torch.cat([self.cmp_k[l], decode_k], dim=0)
+                self.cmp_v[l] = torch.cat([self.cmp_v[l], decode_v], dim=0)
+
             self.k_raw[l] = torch.cat([self.k_raw[l], kn], dim=0)
             self.v_raw[l] = torch.cat([self.v_raw[l], vn], dim=0)
-            cu_full = torch.tensor([0, self.k_raw[l].shape[0]], device=device, dtype=torch.int32)
-            cmp_k_full, cmp_v_full = nsa.build_compressed_cache(self.k_raw[l], self.v_raw[l], cu_full)
-            self.cmp_k[l] = cmp_k_full
-            self.cmp_v[l] = cmp_v_full
         self.past_len += commit_len
         self._stash_kv_new = [None] * len(self.nsa_layers)
 
@@ -327,11 +353,10 @@ class NSATargetModel:
                 return target._orig_forwards[_lid](hidden_states, *args, **kwargs)
             n = hidden_states.shape[1]
             hidden_flat = hidden_states.squeeze(0)
-            device = hidden_states.device
             past_kv_len = target.k_raw[_lid].shape[0]
             total_k_len = past_kv_len + n
-            cu_q = torch.tensor([0, n], device=device, dtype=torch.int32)
-            cu_k = torch.tensor([0, total_k_len], device=device, dtype=torch.int32)
+            cu_q = target._get_cu(hidden_states.device, n)
+            cu_k = target._get_cu(hidden_states.device, total_k_len)
             # Stash (k_new_rope, v_new) from *inside* FSA — same tensors as cat([cache, k_new]) in attention.
             stash: List = []
             out = nsa(
@@ -350,7 +375,8 @@ class NSATargetModel:
                     f"kv_commit_stash expected 1 tuple, got {len(stash)} (position_ids must be set)"
                 )
             kn, vn = stash[0]
-            target._stash_kv_new[_lid] = (kn.clone(), vn.clone())
+            # No need to clone: commit is called immediately after verify in the same round.
+            target._stash_kv_new[_lid] = (kn.detach(), vn.detach())
             return (out.unsqueeze(0), None, None)
 
         return nsa_forward
@@ -359,11 +385,30 @@ class NSATargetModel:
         for l, layer in enumerate(self.llama.model.layers):
             self._orig_forwards[l] = layer.self_attn.forward
             layer.self_attn.forward = self._make_nsa_forward(l)
+        self._hooks_patched = True
 
     def _restore_attn(self):
         for l, layer in enumerate(self.llama.model.layers):
             layer.self_attn.forward = self._orig_forwards[l]
         self._orig_forwards.clear()
+        self._hooks_patched = False
+
+    def _get_cu(self, device: torch.device, end: int) -> torch.Tensor:
+        key = (int(end), device.index if device.type == "cuda" else -1)
+        t = self._cu_cache.get(key)
+        if t is None:
+            t = torch.tensor([0, int(end)], device=device, dtype=torch.int32)
+            self._cu_cache[key] = t
+        return t
+
+    def begin_verify(self):
+        if not self._hooks_patched:
+            self._patch_attn()
+
+    def end_verify(self):
+        if self._hooks_patched:
+            self._restore_attn()
+        self._verify_mode = False
 
     @torch.no_grad()
     def verify(self, verify_ids: torch.Tensor) -> torch.Tensor:
@@ -372,12 +417,8 @@ class NSATargetModel:
         self._stash_kv_new = [None] * len(self.nsa_layers)
         self._pos_ids = torch.arange(self.past_len, self.past_len + n, device=device, dtype=torch.long)
         self._verify_mode = True
-        self._patch_attn()
-        try:
-            out = self.llama(verify_ids, use_cache=False, num_logits_to_keep=n)
-        finally:
-            self._restore_attn()
-            self._verify_mode = False
+        out = self.llama(verify_ids, use_cache=False, num_logits_to_keep=n)
+        self._verify_mode = False
         return out.logits.squeeze(0)
 
 
@@ -642,86 +683,90 @@ class NSASDRunner(DenseSDRunner):
         accepted_total = 0
         rounds = 0
 
-        while len(generated) < max_new_tokens:
-            rounds += 1
-            remain = max_new_tokens - len(generated)
-            n = min(self.n_draft, remain)
-            old_d_len = cache_seq_len(draft_cache)
+        self.nsa_target.begin_verify()
+        try:
+            while len(generated) < max_new_tokens:
+                rounds += 1
+                remain = max_new_tokens - len(generated)
+                n = min(self.n_draft, remain)
+                old_d_len = cache_seq_len(draft_cache)
 
-            draft_ids: List[int] = []
-            draft_logits: List[torch.Tensor] = []
-            d_cur = sanitize_token_tensor(
-                torch.tensor([[cur]], device=device, dtype=torch.long),
-                self._vocab,
-                self.strict_token_check,
-            )
-            for _ in range(n):
-                d_out = self.draft(d_cur, past_key_values=draft_cache, use_cache=True, num_logits_to_keep=1)
-                draft_cache = d_out.past_key_values
-                logit = d_out.logits[:, -1, :].squeeze(0).float()
-                nxt = sample_from_logits(logit, self.temperature, self._vocab)
-                draft_ids.append(nxt)
-                draft_logits.append(logit)
+                draft_ids: List[int] = []
+                draft_logits: List[torch.Tensor] = []
                 d_cur = sanitize_token_tensor(
-                    torch.tensor([[nxt]], device=device, dtype=torch.long),
+                    torch.tensor([[cur]], device=device, dtype=torch.long),
+                    self._vocab,
+                    self.strict_token_check,
+                )
+                for _ in range(n):
+                    d_out = self.draft(d_cur, past_key_values=draft_cache, use_cache=True, num_logits_to_keep=1)
+                    draft_cache = d_out.past_key_values
+                    logit = d_out.logits[:, -1, :].squeeze(0).float()
+                    nxt = sample_from_logits(logit, self.temperature, self._vocab)
+                    draft_ids.append(nxt)
+                    draft_logits.append(logit)
+                    d_cur = sanitize_token_tensor(
+                        torch.tensor([[nxt]], device=device, dtype=torch.long),
+                        self._vocab,
+                        self.strict_token_check,
+                    )
+
+                draft_ids_t = torch.tensor(draft_ids, device=device, dtype=torch.long)
+                draft_logits_t = torch.stack(draft_logits, dim=0)
+                verify_input = sanitize_token_tensor(
+                    torch.tensor([[cur] + draft_ids], device=device, dtype=torch.long),
                     self._vocab,
                     self.strict_token_check,
                 )
 
-            draft_ids_t = torch.tensor(draft_ids, device=device, dtype=torch.long)
-            draft_logits_t = torch.stack(draft_logits, dim=0)
-            verify_input = sanitize_token_tensor(
-                torch.tensor([[cur] + draft_ids], device=device, dtype=torch.long),
-                self._vocab,
-                self.strict_token_check,
-            )
+                # Pure NSA target verify (no dense target forward in the loop)
+                target_logits = self.nsa_target.verify(verify_input).float()
 
-            # Pure NSA target verify (no dense target forward in the loop)
-            target_logits = self.nsa_target.verify(verify_input).float()
+                if self.debug_logits_stats and rounds == 1:
+                    dbg_cache = clone_legacy_past_key_values(prefill_target_kv)
+                    with torch.no_grad():
+                        dense_logits_dbg = self.target(
+                            verify_input,
+                            past_key_values=dbg_cache,
+                            use_cache=True,
+                            num_logits_to_keep=n + 1,
+                        ).logits.squeeze(0).float()
+                    print("\n[debug logits] round 1: dense vs NSA verify (same verify_input, same ctx length)")
+                    for name, t in [("dense", dense_logits_dbg), ("nsa", target_logits)]:
+                        print(
+                            f"  {name}: max={t.max().item():.4f}  std={t.std().item():.4f}  "
+                            f"mean={t.mean().item():.4f}  shape={tuple(t.shape)}"
+                        )
 
-            if self.debug_logits_stats and rounds == 1:
-                dbg_cache = clone_legacy_past_key_values(prefill_target_kv)
-                with torch.no_grad():
-                    dense_logits_dbg = self.target(
-                        verify_input,
-                        past_key_values=dbg_cache,
+                if self.nsa_verify_logits_scale != 1.0:
+                    target_logits = target_logits * self.nsa_verify_logits_scale
+
+                accept_len, accepted_ids = self.sampler.verify(draft_ids_t, target_logits, draft_logits_t)
+                commit_len = 1 + accept_len
+                self.nsa_target.commit_after_verify(commit_len)
+
+                if accept_len == n:
+                    extra = self.draft(
+                        sanitize_token_tensor(
+                            torch.tensor([[draft_ids[-1]]], device=device, dtype=torch.long),
+                            self._vocab,
+                            self.strict_token_check,
+                        ),
+                        past_key_values=draft_cache,
                         use_cache=True,
-                        num_logits_to_keep=n + 1,
-                    ).logits.squeeze(0).float()
-                print("\n[debug logits] round 1: dense vs NSA verify (same verify_input, same ctx length)")
-                for name, t in [("dense", dense_logits_dbg), ("nsa", target_logits)]:
-                    print(
-                        f"  {name}: max={t.max().item():.4f}  std={t.std().item():.4f}  "
-                        f"mean={t.mean().item():.4f}  shape={tuple(t.shape)}"
+                        num_logits_to_keep=1,
                     )
+                    draft_cache = extra.past_key_values
+                draft_cache = trim_legacy_cache(draft_cache, old_d_len + commit_len)
 
-            if self.nsa_verify_logits_scale != 1.0:
-                target_logits = target_logits * self.nsa_verify_logits_scale
-
-            accept_len, accepted_ids = self.sampler.verify(draft_ids_t, target_logits, draft_logits_t)
-            commit_len = 1 + accept_len
-            self.nsa_target.commit_after_verify(commit_len)
-
-            if accept_len == n:
-                extra = self.draft(
-                    sanitize_token_tensor(
-                        torch.tensor([[draft_ids[-1]]], device=device, dtype=torch.long),
-                        self._vocab,
-                        self.strict_token_check,
-                    ),
-                    past_key_values=draft_cache,
-                    use_cache=True,
-                    num_logits_to_keep=1,
-                )
-                draft_cache = extra.past_key_values
-            draft_cache = trim_legacy_cache(draft_cache, old_d_len + commit_len)
-
-            generated.extend(accepted_ids)
-            drafted_total += n
-            accepted_total += accept_len
-            cur = clamp_token_id(accepted_ids[-1], self._vocab)
-            if self.tokenizer.eos_token_id is not None and cur == self.tokenizer.eos_token_id:
-                break
+                generated.extend(accepted_ids)
+                drafted_total += n
+                accepted_total += accept_len
+                cur = clamp_token_id(accepted_ids[-1], self._vocab)
+                if self.tokenizer.eos_token_id is not None and cur == self.tokenizer.eos_token_id:
+                    break
+        finally:
+            self.nsa_target.end_verify()
 
         torch.cuda.synchronize()
         t2 = time.perf_counter()
