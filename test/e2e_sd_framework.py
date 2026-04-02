@@ -112,47 +112,114 @@ def build_prompt_ids(tokenizer, prompt: str, seqlen: int, device: str) -> torch.
 
 
 class SpeculativeSampler:
+    """
+    【推测采样验证器】根据草稿和目标logits，决定哪些token被接受
+    
+    核心原理(推测解码算法)：
+    给定草稿模型生成的n个候选token，用目标模型的logits来验证和纠正。
+    
+    采样方案(最常用的接受方案)：
+    对于每个位置i的候选token t_i：
+      1. 计算接受概率: α = min(1, p_target(t_i) / p_draft(t_i))
+         - p_target > p_draft时总是接受(概率=1)
+         - p_target < p_draft时以一定概率拒绝
+      2. 如果接受，继续到下一位置
+      3. 如果拒绝，从差分分布中重新采样，然后停止验证
+      4. 如果全部接受，从目标模型的下一项(第n+1位)bonus采样一个额外token
+    
+    这样既保持了草稿模型的高效性，也保证了最终输出遵循目标分布。
+    """
+    
     def __init__(self, temperature: float = 1.0, vocab_size: int = 128256):
+        """
+        参数：
+        - temperature: 采样温度(softmax时的温度系数)
+        - vocab_size: 词表大小
+        """
         self.temperature = temperature
         self.vocab_size = vocab_size
 
     def verify(
         self,
-        draft_ids: torch.Tensor,      # [N]
-        target_logits: torch.Tensor,  # [N+1, vocab]
-        draft_logits: torch.Tensor,   # [N, vocab]
+        draft_ids: torch.Tensor,      # [N] 草稿生成的token ids
+        target_logits: torch.Tensor,  # [N+1, vocab] 目标logits(包括bonus position)
+        draft_logits: torch.Tensor,   # [N, vocab] 草稿logits
     ) -> Tuple[int, List[int]]:
+        """
+        【验证和采样】根据logits执行推测解码采样
+        
+        工作流程：
+        1. 将logits非规范化为概率(softmax)
+        2. 逐位置与候选token对比
+        3. 根据概率比值决定接受/拒绝
+        4. 如果全接受则bonus采样；否则拒绝位置进行修正采样
+        
+        参数：
+        - draft_ids: [N] 草稿模型生成的候选token ids
+        - target_logits: [N+1, vocab] 目标模型的logits
+          - target_logits[0:N]用于验证前N个位置
+          - target_logits[N]是bonus token的logits
+        - draft_logits: [N, vocab] 草稿模型的logits
+        
+        返回：
+        - (accepted_count, accepted_ids_list)
+          - accepted_count: 被接受的token数(不含bonus)
+          - accepted_ids_list: 接受的token id列表(可能包含修正的和bonus)
+        """
         n = draft_ids.shape[0]
         vs = self.vocab_size
-        # NSA verify may occasionally produce NaN/Inf on some rows.
-        # Sanitize logits before softmax to keep SD loop robust.
+        
+        # 【Logit清理】NSA可能产生NaN/Inf，需要在softmax前清理
+        # 确保数值稳定性
         t_logits = torch.nan_to_num(target_logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         d_logits = torch.nan_to_num(draft_logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+        
+        # 【概率计算】logits -> 概率分布
         t_probs = torch.softmax(t_logits / max(self.temperature, 1e-6), dim=-1)
         d_probs = torch.softmax(d_logits / max(self.temperature, 1e-6), dim=-1)
 
         accepted = 0
         accepted_ids: List[int] = []
+        
+        # 【主验证循环】对每个位置的候选token进行验证
         for i in range(n):
+            # 1. 获取第i个位置的候选token
             tok = clamp_token_id(int(draft_ids[i].item()), vs)
-            p = float(t_probs[i, tok].item())
-            q = float(d_probs[i, tok].item())
+            p = float(t_probs[i, tok].item())  # 目标在该token的概率
+            q = float(d_probs[i, tok].item())  # 草稿在该token的概率
+            
+            # 2. 计算接受概率: min(1, p/q)
+            # 如果p > q，比值>1，所以α=1，总是接受
+            # 如果p < q，比值<1，以此概率接受(实现"correction")
             acc_prob = min(1.0, p / max(q, 1e-8))
+            
+            # 3. 随机决定是否接受(以acc_prob的概率)
             if random.random() < acc_prob:
+                # 接受这个token，继续验证下一个
                 accepted += 1
                 accepted_ids.append(tok)
                 continue
+            
+            # 4. 拒绝这个token：需要进行修正采样
+            # 修正分布 = max(0, p_target - p_draft)
+            # 这确保修正后的分布的支撑完全被目标包含
             diff = torch.clamp(t_probs[i] - d_probs[i], min=0.0)
             diff = torch.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
             diff_sum = float(diff.sum().item())
+            
+            # 从修正分布采样一个新token作为第i位置的输出
             corrected = (
                 clamp_token_id(int(torch.multinomial(diff / diff_sum, 1).item()), vs)
                 if diff_sum > 0
                 else clamp_token_id(int(t_probs[i].argmax().item()), vs)
             )
             accepted_ids.append(corrected)
+            
+            # 【提前终止】拒绝发生，验证到此torch.multinomial 是什么停止
             return accepted, accepted_ids
 
+        # 【全部接受的情况】前n个都被接受了
+        # bonus采样：从第n+1位置(超出草稿长度的)额外采样一个token
         bonus_row = torch.nan_to_num(t_probs[n], nan=0.0, posinf=0.0, neginf=0.0)
         bonus_sum = float(bonus_row.sum().item())
         bonus = (
@@ -165,17 +232,26 @@ class SpeculativeSampler:
 
 
 class LlamaNSALayer(nn.Module):
+    """
+    将Llama原始的全注意力机制替换为稀疏注意力(NSA)模块
+    
+    工作原理：
+    - 用FlashSparseAttentionDecode实现高效的稀疏注意力计算
+    - 从原Llama注意力层复制权重参数(Q、K、V、Output投影矩阵)
+    - 支持在推测解码时使用稀疏模式加快计算
+    """
+    
     def __init__(
         self,
         llama_attn,
         cfg,
-        topk=16,
-        block_size=64,
-        kernel_size=32,
-        kernel_stride=16,
-        init_blocks=1,
-        local_blocks=2,
-        window_size=512,
+        topk=16,                 # 稀疏选择的top-k注意力头数
+        block_size=64,           # 一个块的大小
+        kernel_size=32,          # 压缩核的大小
+        kernel_stride=16,        # 压缩核的步长
+        init_blocks=1,           # 初始保留的块数
+        local_blocks=2,          # 本地窗口保留的块数
+        window_size=512,         # 本地窗口大小
     ):
         super().__init__()
         num_q = cfg.num_attention_heads
@@ -187,6 +263,7 @@ class LlamaNSALayer(nn.Module):
             rope_theta=cfg.rope_theta,
             rope_scaling=getattr(cfg, "rope_scaling", None),
         )
+        # 创建稀疏注意力模块(包括压缩、稀疏选择、RoPE等)
         self.fsa = FlashSparseAttentionDecode(
             hidden_size=cfg.hidden_size,
             num_q_heads=num_q,
@@ -201,6 +278,9 @@ class LlamaNSALayer(nn.Module):
             window_size=window_size,
             rope_config=rope_cfg,
         )
+        
+        # 【关键】从原Llama注意力层复制权重参数，确保语义相同
+        # 这样NSA层可以直接替换原注意力层
         with torch.no_grad():
             self.fsa.proj_q.weight.copy_(llama_attn.q_proj.weight)
             self.fsa.proj_k.weight.copy_(llama_attn.k_proj.weight)
@@ -210,17 +290,31 @@ class LlamaNSALayer(nn.Module):
         self.kernel_stride = kernel_stride
 
     def build_compressed_cache(self, k_raw, v_raw, cu_k):
+        """
+        【缓存压缩】将原始KV缓存压缩成稀疏表示
+        
+        工作流程：
+        1. 用线性压缩层(compress_key/compress_value)将原始KV压缩
+        2. 压缩后的缓存更小，后续注意力计算会更快
+        
+        参数：
+        - k_raw, v_raw: 原始未压缩的KV缓存 [seq_len, num_kv_heads, head_dim]
+        - cu_k: cumulative length索引 [batch_start, batch_end]
+        
+        返回：
+        - cmp_k, cmp_v: 压缩后的KV缓存
+        """
         cmp_k, _ = linear_compress(
             k_raw,
-            self.fsa.compress_key,
+            self.fsa.compress_key,      # 压缩线性变换矩阵
             cu_k,
             self.kernel_size,
             self.kernel_stride,
-            self.fsa.intra_block_pe,
+            self.fsa.intra_block_pe,    # 块内位置编码
         )
         cmp_v, _ = linear_compress(
             v_raw,
-            self.fsa.compress_value,
+            self.fsa.compress_value,    # 压缩线性变换矩阵
             cu_k,
             self.kernel_size,
             self.kernel_stride,
@@ -229,6 +323,22 @@ class LlamaNSALayer(nn.Module):
         return cmp_k, cmp_v
 
     def forward(self, hidden, k_raw, v_raw, cmp_k, cmp_v, cu_q, cu_k, position_ids, kv_commit_stash=None):
+        """
+        【NSA前向传播】稀疏注意力的计算
+        
+        工作流程：
+        1. 接收当前token的隐藏状态
+        2. 用压缩的KV缓存和top-k稀疏选择进行注意力计算
+        3. 可选：将新的KV投影(k_new_rope, v_new)保存到stash，以便后续缓存更新
+        
+        参数：
+        - hidden: 当前token的隐藏状态
+        - k_raw, v_raw: 历史KV的原始形式(用于扩展)
+        - cmp_k, cmp_v: 压缩的KV缓存
+        - cu_q, cu_k: query/key的cumulative长度索引
+        - position_ids: 当前token的位置编码id
+        - kv_commit_stash: 可选的列表，用来保存新的KV张量供后续缓存更新
+        """
         return self.fsa(
             hidden,
             cu_q,
@@ -244,53 +354,126 @@ class LlamaNSALayer(nn.Module):
 
 
 class NSATargetModel:
+    """
+    【目标模型管理器】管理大型LLM(目标模型)的KV缓存和验证逻辑
+    
+    核心职责：
+    1. 维护所有层的K/V缓存(原始和压缩形式)
+    2. 在"验证模式"下用NSA替换原始注意力机制
+    3. 处理缓存提交：将验证阶段产生的新KV追加到缓存
+    
+    关键理念：
+    - 为了算力效率，验证多个候选token时用稀疏注意力而不是全稠密注意力
+    - 通过Hook机制动态替换各层的前向传播函数
+    """
+    
     def __init__(self, llama, nsa_layers: List[LlamaNSALayer]):
+        """
+        初始化目标模型管理器
+        
+        参数：
+        - llama: 原始的Llama模型(包含所有层)
+        - nsa_layers: NSA替换层的列表(长度=num_hidden_layers)
+        """
         self.llama = llama
         self.nsa_layers = nsa_layers
-        self.k_raw = [None] * len(nsa_layers)
-        self.v_raw = [None] * len(nsa_layers)
-        self.cmp_k = [None] * len(nsa_layers)
-        self.cmp_v = [None] * len(nsa_layers)
-        self.past_len = 0
-        self._orig_forwards = {}
-        self._verify_mode = False
-        self._hooks_patched = False
-        self._pos_ids = None
-        # Per-layer (k_new_rope, v_new) from the last verify forward; used for pure-NSA cache commit.
+        
+        # 【缓存存储】为每一层维护K/V的两种形式
+        self.k_raw = [None] * len(nsa_layers)      # 原始未压缩的K [seq_len, num_kv_heads, head_dim]
+        self.v_raw = [None] * len(nsa_layers)      # 原始未压缩的V
+        self.cmp_k = [None] * len(nsa_layers)      # 压缩后的K缓存(用于稀疏注意力)
+        self.cmp_v = [None] * len(nsa_layers)      # 压缩后的V缓存
+        
+        self.past_len = 0                          # 当前缓存中已有的token总数
+        self._orig_forwards = {}                   # 保存各层原始的前向函数(用于恢复)
+        self._verify_mode = False                  # 标志：当前是否在验证阶段
+        self._hooks_patched = False                # 标志：Hook是否已安装
+        self._pos_ids = None                       # 当前验证批次的position ids
+        
+        # 【关键】验证阶段产生的新KV投影，待提交到缓存
+        # 结构: [(k_new_rope, v_new), ...] for each layer
         self._stash_kv_new: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * len(nsa_layers)
-        # Reuse tiny cu tensors to avoid per-layer/per-round allocations.
+        
+        # 【优化】复用cu张量，避免重复分配
         self._cu_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
     def init_from_prefill(self, past_key_values):
+        """
+        【初始化缓存】从预填充(prefill)阶段的密集KV缓存初始化NSA缓存
+        
+        工作流程：
+        1. 提取预填充后的Llama缓存(HF格式: [batch=1, num_heads, seq_len, head_dim])
+        2. 转换为NSA格式: [seq_len, num_heads, head_dim] (去掉batch维，转置序列和头维)
+        3. 对每一层进行压缩，得到高效的稀疏缓存
+        
+        参数：
+        - past_key_values: Llama模型返回的密集KV缓存(来自prefill阶段)
+        """
         device = self.nsa_layers[0].fsa.proj_q.weight.device
         dtype = self.nsa_layers[0].fsa.proj_q.weight.dtype
-        self.past_len = cache_seq_len(past_key_values)
+        self.past_len = cache_seq_len(past_key_values)  # 记录预填充长度
+        
+        # 逐层处理KV缓存
         for l, nsa in enumerate(self.nsa_layers):
-            k, v = past_key_values[l]
-            k_raw = k.squeeze(0).permute(1, 0, 2).contiguous().to(dtype)
+            k, v = past_key_values[l]  # HF格式: [1, num_heads, seq_len, head_dim]
+            
+            # 【转换】从HF格式转为NSA格式
+            k_raw = k.squeeze(0).permute(1, 0, 2).contiguous().to(dtype)  
+            # squeeze(0): 去掉batch维 
+            # permute(1, 0, 2): [num_heads, seq_len, head_dim] -> [seq_len, num_heads, head_dim]
+            
             v_raw = v.squeeze(0).permute(1, 0, 2).contiguous().to(dtype)
+            
+            # 创建cumulative索引: [0, k_raw.shape[0]] 表示整个序列
             cu_k = torch.tensor([0, k_raw.shape[0]], device=device, dtype=torch.int32)
+            
+            # 【压缩】对原始KV进行压缩
             cmp_k, cmp_v = nsa.build_compressed_cache(k_raw, v_raw, cu_k)
+            
+            # 【保存】存储原始和压缩缓存
             self.k_raw[l] = k_raw
             self.v_raw[l] = v_raw
             self.cmp_k[l] = cmp_k
             self.cmp_v[l] = cmp_v
 
     def append_from_dense_cache(self, new_past_key_values, old_len: int, commit_len: int):
-        """Optional: align NSA KV with dense HF cache (debug / hybrid). Not used in pure-NSA-SD."""
+        """
+        【可选的混合模式】将密集HF缓存的增量与NSA缓存对齐(调试/混合方案用)
+        
+        【用途】
+        这个方法在纯NSA-SD流程中NOT被使用，主要用于：
+        - 调试：对比NSA缓存和密集缓存是否一致
+        - 混合方案：某些层用密集注意力，某些层用NSA
+        
+        【工作流程】
+        1. 从new_past_key_values中提取增量部分[old_len : old_len+commit_len]
+        2. 转换格式从HF [1, num_heads, seq, dim] 到 NSA [seq, num_heads, dim]
+        3. 追加到k_raw/v_raw
+        4. 重新压缩整个缓存得到完整的cmp_k/cmp_v
+        
+        参数：
+        - new_past_key_values: 完整的HF格式缓存(包含历史和新部分)
+        - old_len: 增量之前的缓存长度
+        - commit_len: 要提交的新token数
+        """
         if commit_len <= 0:
             return
         device = self.nsa_layers[0].fsa.proj_q.weight.device
         for l, nsa in enumerate(self.nsa_layers):
             k_full, v_full = new_past_key_values[l]
+            # 【提取增量】只取新增的部分
             k_delta = k_full[:, :, old_len : old_len + commit_len, :]
             v_delta = v_full[:, :, old_len : old_len + commit_len, :]
+            
+            # 【转换格式】HF -> NSA格式
             k_raw_delta = k_delta.squeeze(0).permute(1, 0, 2).contiguous()
             v_raw_delta = v_delta.squeeze(0).permute(1, 0, 2).contiguous()
 
+            # 【追加】如果有新KV，追加到缓存并重新压缩
             if k_raw_delta.shape[0] > 0:
                 self.k_raw[l] = torch.cat([self.k_raw[l], k_raw_delta], dim=0)
                 self.v_raw[l] = torch.cat([self.v_raw[l], v_raw_delta], dim=0)
+                # 重新压缩整个缓存
                 cu_full = torch.tensor([0, self.k_raw[l].shape[0]], device=device, dtype=torch.int32)
                 cmp_k_full, cmp_v_full = nsa.build_compressed_cache(self.k_raw[l], self.v_raw[l], cu_full)
                 self.cmp_k[l] = cmp_k_full
@@ -299,32 +482,54 @@ class NSATargetModel:
 
     def commit_after_verify(self, commit_len: int):
         """
-        Append committed raw KV from stashed NSA projections (same as inside FlashSparseAttentionDecode:
-        k_new after RoPE, v_new without extra RoPE), then incrementally append cmp_k/cmp_v.
+        【缓存提交】将验证阶段产生的新KV追加到NSA缓存
+        
+        【背景】验证阶段(verify)时，NSA层通过Hook被调用，会产生新的KV投影。
+        这些新KV被保存在_stash_kv_new中，现在需要官方提交到缓存系统。
+        
+        【工作流程】：
+        1. 从stash中提取验证阶段产生的k_new_rope(带RoPE)和v_new(原始)
+        2. 用incremental compression将新KV压缩(利用缓存的一部分作为context)
+        3. 将压缩的新KV追加到cmp_k/cmp_v
+        4. 将原始的新KV追加到k_raw/v_raw
+        5. 更新缓存长度计数
+        
+        【参数】：
+        - commit_len: 要提交的新token数(包括前一个token)
         """
         if commit_len <= 0:
             return
         dtype = self.k_raw[0].dtype
+        
+        # 逐层处理
         for l, nsa in enumerate(self.nsa_layers):
+            # 【提取新KV】从验证阶段的stash中取出
             st = self._stash_kv_new[l]
             if st is None:
                 raise RuntimeError("commit_after_verify: missing stashed KV; verify() did not run?")
             k_new_rope, v_new = st
+            
+            # 只取有效的部分(commit_len个token)
             kn = k_new_rope[:commit_len].contiguous().to(dtype)
             vn = v_new[:commit_len].contiguous().to(dtype)
+            
+            # 【准备增量压缩的context】
+            # 用缓存末尾的kernel_size-1个KV作为context，确保压缩的连续性
             prev_raw_len = self.k_raw[l].shape[0]
             buffer_size = min(nsa.kernel_size - 1, prev_raw_len)
             init_buf_k = self.k_raw[l][-buffer_size:] if buffer_size > 0 else None
             init_buf_v = self.v_raw[l][-buffer_size:] if buffer_size > 0 else None
 
+            # 【增量压缩】针对新KV apply incremental compression
+            # _linear_compress_decode利用缓存context进行压缩
             decode_k = _linear_compress_decode(
                 kn,
                 nsa.fsa.compress_key,
                 nsa.kernel_size,
                 nsa.kernel_stride,
                 nsa.fsa.intra_block_pe,
-                prev_raw_len,
-                init_buf_k,
+                prev_raw_len,  # 告诉算子缓存的当前长度
+                init_buf_k,    # context KV
             )
             decode_v = _linear_compress_decode(
                 vn,
@@ -335,65 +540,146 @@ class NSATargetModel:
                 prev_raw_len,
                 init_buf_v,
             )
+            
+            # 【追加压缩缓存】
             if decode_k is not None:
                 self.cmp_k[l] = torch.cat([self.cmp_k[l], decode_k], dim=0)
                 self.cmp_v[l] = torch.cat([self.cmp_v[l], decode_v], dim=0)
 
+            # 【追加原始缓存】
             self.k_raw[l] = torch.cat([self.k_raw[l], kn], dim=0)
             self.v_raw[l] = torch.cat([self.v_raw[l], vn], dim=0)
+        
+        # 【更新缓存长度】
         self.past_len += commit_len
+        # 【清空stash】当前stash已被消费，准备下一轮
         self._stash_kv_new = [None] * len(self.nsa_layers)
 
     def _make_nsa_forward(self, layer_idx: int):
+        """
+        【Hook工厂】为某一层创建自定义前向函数，在验证模式下用NSA替换标准注意力
+        
+        核心思想：
+        - 返回一个闭包(closure)，能访问自己的层索引和NSA层
+        - 当模型前向传播时，该函数被调用替代原始注意力函数
+        - verify_mode=True时：用NSA(稀疏)计算；=False时：调用原始注意力
+        
+        返回：
+        - nsa_forward: 替换函数，签名与原始注意力层一致
+        """
         target = self
         nsa = self.nsa_layers[layer_idx]
 
         def nsa_forward(hidden_states=None, *args, _lid=layer_idx, **kwargs):
+            """
+            自定义前向函数，在验证模式下用NSA稀疏注意力
+            
+            参数：
+            - hidden_states: 当前层的输入 [batch=1, seq_len, hidden_size]
+            - *args, **kwargs: 原始注意力函数的其他参数
+            - _lid: 层索引(通过闭包传入)
+            
+            逻辑：
+            1. 如果不在验证模式，调用原始注意力(回退到标准方案)
+            2. 否则，用NSA计算：
+               - 获取序列长度
+               - 构建query/key的cumulative索引
+               - 调用NSA层，并从中提取新的KV投影
+               - 保存这些新KV供后续缓存提交
+            """
+            # 【回退】如果不在验证模式，直接使用原始注意力
             if not target._verify_mode:
                 return target._orig_forwards[_lid](hidden_states, *args, **kwargs)
-            n = hidden_states.shape[1]
-            hidden_flat = hidden_states.squeeze(0)
-            past_kv_len = target.k_raw[_lid].shape[0]
-            total_k_len = past_kv_len + n
-            cu_q = target._get_cu(hidden_states.device, n)
-            cu_k = target._get_cu(hidden_states.device, total_k_len)
-            # Stash (k_new_rope, v_new) from *inside* FSA — same tensors as cat([cache, k_new]) in attention.
+            
+            # 【验证模式】用NSA计算，下面分解步骤：
+            
+            # 1. 获取输入序列长度
+            n = hidden_states.shape[1]  # [batch=1, n, hidden_size] -> n个新token
+            hidden_flat = hidden_states.squeeze(0)  # [n, hidden_size]
+            
+            # 2. 计算总的key长度 = 历史缓存长度 + 新token数
+            past_kv_len = target.k_raw[_lid].shape[0]  # 历史缓存中K的序列长度
+            total_k_len = past_kv_len + n              # 总长度
+            
+            # 3. 构建cumulative索引(用于压缩核和稀疏计算)
+            cu_q = target._get_cu(hidden_states.device, n)              # query: [0, n]
+            cu_k = target._get_cu(hidden_states.device, total_k_len)    # key: [0, total_k_len]
+            
+            # 4. 【关键】调用NSA层
+            # kv_commit_stash是一个列表，NSA层会在其中放入新的KV投影
             stash: List = []
             out = nsa(
                 hidden_flat,
-                target.k_raw[_lid],
-                target.v_raw[_lid],
-                target.cmp_k[_lid],
-                target.cmp_v[_lid],
+                target.k_raw[_lid],      # 历史原始K缓存
+                target.v_raw[_lid],      # 历史原始V缓存
+                target.cmp_k[_lid],      # 历史压缩K缓存
+                target.cmp_v[_lid],      # 历史压缩V缓存
                 cu_q,
                 cu_k,
-                target._pos_ids,
-                kv_commit_stash=stash,
+                target._pos_ids,         # 当前验证批的position ids
+                kv_commit_stash=stash,   # 接收新的KV投影
             )
+            
+            # 5. 提取新的KV投影(k_new_rope已带RoPE, v_new是原始值)
             if len(stash) != 1:
                 raise RuntimeError(
                     f"kv_commit_stash expected 1 tuple, got {len(stash)} (position_ids must be set)"
                 )
             kn, vn = stash[0]
-            # No need to clone: commit is called immediately after verify in the same round.
+            # 保存这些新KV，供后续commit_after_verify使用
             target._stash_kv_new[_lid] = (kn.detach(), vn.detach())
+            
+            # 6. 返回格式转换：NSA返回[n, hidden_size]，需要转为[batch=1, n, hidden_size]和两个None(缓存)
             return (out.unsqueeze(0), None, None)
 
         return nsa_forward
 
     def _patch_attn(self):
+        """
+        【安装Hook】替换所有层的注意力函数为NSA版本
+        
+        机制：
+        - 遍历Llama模型的每一层
+        - 保存原始的注意力前向函数到_orig_forwards(用于恢复)
+        - 用_make_nsa_forward创建的函数替换原函数
+        
+        这样当模型前向传播时，会使用NSA而不是标准注意力
+        """
         for l, layer in enumerate(self.llama.model.layers):
-            self._orig_forwards[l] = layer.self_attn.forward
-            layer.self_attn.forward = self._make_nsa_forward(l)
+            self._orig_forwards[l] = layer.self_attn.forward  # 保存原始函数
+            layer.self_attn.forward = self._make_nsa_forward(l)  # 用NSA版本替换
         self._hooks_patched = True
 
     def _restore_attn(self):
+        """
+        【卸载Hook】恢复所有层的原始注意力函数
+        
+        用途：
+        - 验证阶段结束后调用
+        - 或者用于调试/对比实验
+        """
         for l, layer in enumerate(self.llama.model.layers):
             layer.self_attn.forward = self._orig_forwards[l]
         self._orig_forwards.clear()
         self._hooks_patched = False
 
     def _get_cu(self, device: torch.device, end: int) -> torch.Tensor:
+        """
+        【获取或创建cumulative索引张量】用于压缩和稀疏计算
+        
+        cumulative长度张量表示："当前batch的起始=0，结束=end"
+        用于告诉压缩算子和稀疏注意力"处理多少个token"
+        
+        参数：
+        - device: 张量所在的设备
+        - end: cumulative长度的终点值
+        
+        返回：
+        - 张量[0, end]，数据类型int32
+        
+        优化：
+        - 缓存已创建过的cu张量，避免重复分配
+        """
         key = (int(end), device.index if device.type == "cuda" else -1)
         t = self._cu_cache.get(key)
         if t is None:
@@ -402,23 +688,59 @@ class NSATargetModel:
         return t
 
     def begin_verify(self):
+        """【验证开始】安装Hook，准备进入验证模式"""
         if not self._hooks_patched:
             self._patch_attn()
 
     def end_verify(self):
+        """【验证结束】卸载Hook，恢复正常注意力"""
         if self._hooks_patched:
             self._restore_attn()
         self._verify_mode = False
 
     @torch.no_grad()
     def verify(self, verify_ids: torch.Tensor) -> torch.Tensor:
+        """
+        【验证前向传播】用NSA稀疏注意力验证多个候选token的logits
+        
+        工作流程：
+        1. 准备position ids：从past_len到past_len+n(新token的位置)
+        2. 打开验证模式标志(verify_mode=True)
+        3. 调用Llama模型的前向传播
+           - 所有注意力层会使用Hook调用NSA版本而不是标准注意力
+           - NSA版本返回稀疏注意力输出，显著降低计算量
+           - NSA层会将新的KV投影保存到_stash_kv_new供后续提交
+        4. 关闭验证模式(verify_mode=False)
+        5. 返回最后一层的logits
+        
+        参数：
+        - verify_ids: 验证输入，形状[1, n+1]
+                   第一个是前一个token，后面n个是候选token
+        
+        返回：
+        - logits: [n+1, vocab_size] 所有n+1个token的logits输出
+        """
         n = verify_ids.shape[1]
         device = verify_ids.device
+        
+        # 【重置stash】准备接收新的KV投影
         self._stash_kv_new = [None] * len(self.nsa_layers)
+        
+        # 【构建position ids】
+        # 从past_len(当前缓存长度)开始，生成n个连续的位置编码
+        # 这告诉RoPE每个token的绝对位置，确保位置编码正确
         self._pos_ids = torch.arange(self.past_len, self.past_len + n, device=device, dtype=torch.long)
+        
+        # 【开启验证模式】标记Hook应该使用NSA而不是标准注意力
         self._verify_mode = True
+        
+        # 【前向传播】Llama模型的标准前向，但所有注意力被Hook替换为NSA
         out = self.llama(verify_ids, use_cache=False, num_logits_to_keep=n)
+        
+        # 【关闭验证模式】恢复正常
         self._verify_mode = False
+        
+        # 【返回logits】[1, n, vocab_size] -> [n, vocab_size]
         return out.logits.squeeze(0)
 
 
@@ -597,6 +919,24 @@ class DenseSDRunner:
 
 
 class NSASDRunner(DenseSDRunner):
+    """
+    【NSA推测性解码运行器】结合NSA稀疏注意力的高效推测解码实现
+    
+    架构对比：
+    - DenseSDRunner: 草稿(快速小模型) + 目标(全密集大模型)
+    - NSASDRunner: 草稿(快速小模型) + 目标(NSA稀疏大模型) ← 本类
+    
+    核心优势：
+    - 验证多个候选token时用稀疏注意力而不是全稠密注意力
+    - 显著降低验证阶段的算力消耗，加快推测解码速度
+    
+    工作流程：
+    1. 初始化NSA层(替换原Llama注意力为稀疏注意力)
+    2. 预填充(prefill)后初始化NSA缓存
+    3. 循环：草稿 → NSA验证 → 采样验证 → 缓存提交
+    4. 输出生成的token序列
+    """
+    
     def __init__(
         self,
         target_model,
@@ -610,6 +950,22 @@ class NSASDRunner(DenseSDRunner):
         nsa_verify_logits_scale: float = 1.0,
         debug_logits_stats: bool = False,
     ):
+        """
+        初始化NSA推测解码器
+        
+        参数：
+        - target_model: 目标大模型(Llama)
+        - draft_model: 草稿小模型(快速生成候选token)
+        - tokenizer: 分词器
+        - n_draft: 每轮生成的草稿token数(通常8-16)
+        - temperature: 采样温度(越大输出越随机)
+        - topk: NSA稀疏注意力的top-k值
+        - nsa_ckpt: NSA训练好的检查点路径(可选)
+        - strict_token_check: 是否严格检查token id
+        - nsa_verify_logits_scale: NSA logit的缩放因子(用于补偿NSA和dense logit尺度差异)
+        - debug_logits_stats: 是否打印debug信息(首轮对比dense vs NSA logits)
+        """
+        # 【调用父类初始化】复用基础SD框架(采样、缓存管理等)
         super().__init__(
             target_model,
             draft_model,
@@ -620,6 +976,8 @@ class NSASDRunner(DenseSDRunner):
         )
         self.nsa_verify_logits_scale = nsa_verify_logits_scale
         self.debug_logits_stats = debug_logits_stats
+        
+        # 【创建NSA层】为目标模型的每一层创建对应的NSA替换层
         cfg = target_model.config
         self.nsa_layers = [
             LlamaNSALayer(target_model.model.layers[l].self_attn, cfg, topk=topk).to(
@@ -627,7 +985,10 @@ class NSASDRunner(DenseSDRunner):
             )
             for l in range(cfg.num_hidden_layers)
         ]
+        
+        # 【加载或初始化NSA权重】
         if nsa_ckpt:
+            # 从检查点加载训练好的NSA权重
             ckpt_path = nsa_ckpt
             if os.path.isdir(ckpt_path):
                 ckpt_path = os.path.join(ckpt_path, "ckpt.pt")
@@ -635,70 +996,139 @@ class NSASDRunner(DenseSDRunner):
                 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             except TypeError:
                 ckpt = torch.load(ckpt_path, map_location="cpu")
-            nsa_sd = ckpt["nsa"]
+            nsa_sd = ckpt["nsa"]  # 提取NSA权重字典
             for l_key, sd in nsa_sd.items():
                 self.nsa_layers[int(l_key)].fsa.load_state_dict(sd, strict=True)
         else:
+            # 没有检查点时，用均值池初始化(相当于对所有KV求均值)
             self._init_mean_pool()
+        
+        # 【创建NSA目标模型管理器】负责缓存、验证、Hook等
         self.nsa_target = NSATargetModel(target_model, self.nsa_layers)
 
     def _init_mean_pool(self):
+        """
+        【均值池初始化】当没有预训练NSA检查点时，用简单的均值池策略初始化NSA压缩权重
+        
+        初始化策略：
+        1. compress_key和compress_value初始化为单位矩阵(mean pooling)
+           - 每个kernel_size of keys被等权重求均值
+        2. gate (gating network)初始化为特定值
+           - 第一个权重:=-1e-2 (倾向于不选择)
+           - 其他权重:=-1e-2 (小的负值，弱化信号)
+        
+        这样NSA在训练前能表现得接近全注意力(求均值)，然后通过训练逐步学习稀疏模式
+        """
         cfg = self.target.config
         device = next(self.target.parameters()).device
         dtype = next(self.target.parameters()).dtype
         kernel_size = self.nsa_layers[0].kernel_size
         head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+        
+        # 【单位矩阵】eye(head_dim) / kernel_size 相当于平均所有kernel_size个key
         eye = torch.eye(head_dim, device=device, dtype=dtype) / kernel_size
+        
         with torch.no_grad():
             for nsa in self.nsa_layers:
-                ck = nsa.fsa.compress_key
-                cv = nsa.fsa.compress_value
+                ck = nsa.fsa.compress_key      # [out_dim, kernel_size*head_dim]
+                cv = nsa.fsa.compress_value    # [out_dim, kernel_size*head_dim]
+                
+                # 清零初始化
                 ck.zero_()
                 cv.zero_()
+                
+                # 【关键】设置为"均值"矩阵
+                # 每个i对应的kernel_size个head_dims设为单位矩阵/kernel_size
                 for i in range(kernel_size):
                     ck[:, i * head_dim : (i + 1) * head_dim, :] = eye
                     cv[:, i * head_dim : (i + 1) * head_dim, :] = eye
-                nn.init.zeros_(nsa.fsa.gate[0].weight)
-                nsa.fsa.gate[0].weight[1].fill_(0.0)
-                nsa.fsa.gate[0].weight[0].fill_(-1e-2)
-                nsa.fsa.gate[0].weight[2].fill_(-1e-2)
+                
+                # 【初始化gate (gating network)】用于学习每个位置的权重
+                nn.init.zeros_(nsa.fsa.gate[0].weight)  # 先全零
+                nsa.fsa.gate[0].weight[1].fill_(0.0)    # 第二行用0.0初始化
+                nsa.fsa.gate[0].weight[0].fill_(-1e-2)  # 第一行用小负值初始化
+                nsa.fsa.gate[0].weight[2].fill_(-1e-2)  # 第三行用小负值初始化
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int):
+        """
+        【NSA推测解码主生成循环】
+        
+        工作流程总览：
+        ┌──────────────────────────────────────────────────┐
+        │1. 预填充(Prefill)                               │
+        │   - 目标和草稿模型都生成初始token               │
+        │   - 初始化NSA缓存(从密集HF缓存转换)             │
+        └──────────────────────────────────────────────────┘
+                            ↓
+        ┌──────────────────────────────────────────────────┐
+        │2. 推测解码循环(Speculative Decoding Loop)       │
+        │   a) 草稿阶段：草稿模型快速生成n个候选token     │
+        │   b) 验证阶段：NSA目标模型用稀疏注意验证        │
+        │   c) 采样阶段：根据概率接受/拒绝候选            │
+        │   d) 提交阶段：将接受的token追加到缓存          │
+        │   重复上述直到生成足够token或遇到EOS            │
+        └──────────────────────────────────────────────────┘
+                            ↓
+        ┌──────────────────────────────────────────────────┐
+        │3. 返回结果                                      │
+        │   - 生成的token列表                              │
+        │   - 性能统计(TPS、接受率等)                      │
+        └──────────────────────────────────────────────────┘
+        """
         device = input_ids.device
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+        
+        # ========== 预填充阶段 ==========
+        # 【目标模型预填充】用密集注意力处理初始prompt
         t_prefill = self.target(input_ids, use_cache=True, num_logits_to_keep=1)
+        
+        # 【草稿模型预填充】用草稿模型也处理同样的prompt
         d_prefill = self.draft(input_ids, use_cache=True, num_logits_to_keep=1)
+        
+        # 【采样首个token】从目标模型的预填充输出采样
         cur = sample_from_logits(t_prefill.logits[:, -1, :], self.temperature, self._vocab)
-        # One-time dense prefill to bootstrap k_raw/v_raw/cmp (same as e2e_sd_nsa); decode loop is pure NSA.
+        
+        # 【初始化NSA缓存】关键步骤：将密集HF缓存转换为NSA格式
+        # 这只在整个生成过程中做一次，之后的解码循环全部用NSA
         prefill_target_kv = t_prefill.past_key_values
         self.nsa_target.init_from_prefill(prefill_target_kv)
+        
+        # 【草稿模型缓存】继续用标准缓存
         draft_cache = d_prefill.past_key_values
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-
-        generated = []
-        drafted_total = 0
-        accepted_total = 0
-        rounds = 0
-
+        
+        # ========== 初始化统计变量 ==========
+        generated = []           # 最终输出token列表
+        drafted_total = 0        # 总共草稿生成的token数
+        accepted_total = 0       # 总共被接受的token数
+        rounds = 0              # 推测解码的轮数
+        
+        # ========== 推测解码主循环 ==========
+        # 【安装Hook】在验证模式下替换注意力为NSA版本
         self.nsa_target.begin_verify()
         try:
             while len(generated) < max_new_tokens:
                 rounds += 1
                 remain = max_new_tokens - len(generated)
-                n = min(self.n_draft, remain)
+                n = min(self.n_draft, remain)  # 本轮生成的草稿token数
                 old_d_len = cache_seq_len(draft_cache)
 
-                draft_ids: List[int] = []
-                draft_logits: List[torch.Tensor] = []
+                # ───────── 第一步：草稿生成 ─────────
+                # 【思路】用快速小模型草稿地生成n个候选token
+                draft_ids: List[int] = []        # 本轮生成的token ids
+                draft_logits: List[torch.Tensor] = []  # 对应的logits(用于验证)
                 d_cur = sanitize_token_tensor(
                     torch.tensor([[cur]], device=device, dtype=torch.long),
                     self._vocab,
                     self.strict_token_check,
                 )
+                
+                # 逐个生成草稿token
                 for _ in range(n):
+                    # 草稿模型单步前向
                     d_out = self.draft(d_cur, past_key_values=draft_cache, use_cache=True, num_logits_to_keep=1)
                     draft_cache = d_out.past_key_values
                     logit = d_out.logits[:, -1, :].squeeze(0).float()
@@ -711,17 +1141,23 @@ class NSASDRunner(DenseSDRunner):
                         self.strict_token_check,
                     )
 
+                # 转换为张量便于后续处理
                 draft_ids_t = torch.tensor(draft_ids, device=device, dtype=torch.long)
                 draft_logits_t = torch.stack(draft_logits, dim=0)
+                
+                # ───────── 第二步：目标模型验证 ─────────
+                # 【思路】构建验证输入：[前一个token] + [n个候选token]
                 verify_input = sanitize_token_tensor(
                     torch.tensor([[cur] + draft_ids], device=device, dtype=torch.long),
                     self._vocab,
                     self.strict_token_check,
                 )
 
-                # Pure NSA target verify (no dense target forward in the loop)
+                # 【NSA验证】用稀疏注意力验证所有n+1个token
+                # NSATargetModel会自动用Hook替换注意力为NSA版本
                 target_logits = self.nsa_target.verify(verify_input).float()
 
+                # 【调试】如果启用debug_logits_stats，第一轮打印dense vs NSA的logit对比
                 if self.debug_logits_stats and rounds == 1:
                     dbg_cache = clone_legacy_past_key_values(prefill_target_kv)
                     with torch.no_grad():
@@ -738,13 +1174,21 @@ class NSASDRunner(DenseSDRunner):
                             f"mean={t.mean().item():.4f}  shape={tuple(t.shape)}"
                         )
 
+                # 【logit缩放】可选的logit缩放用于补偿NSA和dense的尺度差异
                 if self.nsa_verify_logits_scale != 1.0:
                     target_logits = target_logits * self.nsa_verify_logits_scale
 
+                # ───────── 第三步：采样验证 ─────────
+                # 【思路】根据目标和草稿的概率分布，决定哪些token被接受
+                # 这是广为人知的speculative decoding采样方案
                 accept_len, accepted_ids = self.sampler.verify(draft_ids_t, target_logits, draft_logits_t)
-                commit_len = 1 + accept_len
+                commit_len = 1 + accept_len  # 包括前一个token
+                
+                # ───────── 第四步：缓存提交 ─────────
+                # 【提交】将被接受的新token追加到NSA缓存
                 self.nsa_target.commit_after_verify(commit_len)
 
+                # 如果全部n个候选都被接受，需要生成一个额外的token供下一轮使用
                 if accept_len == n:
                     extra = self.draft(
                         sanitize_token_tensor(
@@ -757,19 +1201,27 @@ class NSASDRunner(DenseSDRunner):
                         num_logits_to_keep=1,
                     )
                     draft_cache = extra.past_key_values
+                
+                # 【草稿缓存修剪】保持缓存大小一致
                 draft_cache = trim_legacy_cache(draft_cache, old_d_len + commit_len)
 
+                # ───────── 更新统计和状态 ─────────
                 generated.extend(accepted_ids)
                 drafted_total += n
                 accepted_total += accept_len
                 cur = clamp_token_id(accepted_ids[-1], self._vocab)
+                
+                # 【EOS检查】如果输出了结束符，提前终止
                 if self.tokenizer.eos_token_id is not None and cur == self.tokenizer.eos_token_id:
                     break
         finally:
+            # 【卸载Hook】无论是否正常结束，都要恢复原始注意力
             self.nsa_target.end_verify()
 
         torch.cuda.synchronize()
         t2 = time.perf_counter()
+        
+        # ========== 计算性能统计 ==========
         prefill_t = t1 - t0
         decode_t = t2 - t1
         total_t = t2 - t0
