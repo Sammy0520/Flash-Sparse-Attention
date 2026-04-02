@@ -322,7 +322,7 @@ class LlamaNSALayer(nn.Module):
         )
         return cmp_k, cmp_v
 
-    def forward(self, hidden, k_raw, v_raw, cmp_k, cmp_v, cu_q, cu_k, position_ids, kv_commit_stash=None):
+    def forward(self, hidden, k_raw, k_buffer, v_raw, cmp_k, cmp_v, cu_q, cu_k, position_ids, kv_commit_stash=None):
         """
         【NSA前向传播】稀疏注意力的计算
         
@@ -340,13 +340,14 @@ class LlamaNSALayer(nn.Module):
         - kv_commit_stash: 可选的列表，用来保存新的KV张量供后续缓存更新
         """
         return self.fsa(
-            hidden,
-            cu_q,
-            cu_k,
-            k_raw,
-            v_raw,
-            cmp_k,
-            cmp_v,
+            x=hidden,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            k_cache=k_raw,
+            k_buffer=k_buffer,
+            v_cache=v_raw,
+            cmp_k_cache=cmp_k,
+            cmp_v_cache=cmp_v,
             attention_mask=None,
             position_ids=position_ids,
             kv_commit_stash=kv_commit_stash,
@@ -379,7 +380,8 @@ class NSATargetModel:
         self.nsa_layers = nsa_layers
         
         # 【缓存存储】为每一层维护K/V的两种形式
-        self.k_raw = [None] * len(nsa_layers)      # 原始未压缩的K [seq_len, num_kv_heads, head_dim]
+        self.k_raw = [None] * len(nsa_layers)      # 原始未压缩的rope(K) [seq_len, num_kv_heads, head_dim]
+        self.k_buffer = [None] * len(nsa_layers)   # 未压缩的K
         self.v_raw = [None] * len(nsa_layers)      # 原始未压缩的V
         self.cmp_k = [None] * len(nsa_layers)      # 压缩后的K缓存(用于稀疏注意力)
         self.cmp_v = [None] * len(nsa_layers)      # 压缩后的V缓存
@@ -428,9 +430,20 @@ class NSATargetModel:
             cu_k = torch.tensor([0, k_raw.shape[0]], device=device, dtype=torch.int32)
             
             # 【压缩】对原始KV进行压缩
-            cmp_k, cmp_v = nsa.build_compressed_cache(k_raw, v_raw, cu_k)
-            
+            position_ids = torch.arange(0, k_raw.shape[0], device=k_raw.device)
+            k_raw_nope = nsa.fsa.rope(
+                k_raw,
+                cu_k,
+                position_ids=-position_ids,
+            )
+            cmp_k, cmp_v = nsa.build_compressed_cache(k_raw_nope, v_raw, cu_k)
+
             # 【保存】存储原始和压缩缓存
+            # I guess k_raw here has rope applied.
+            buffer_size = min(nsa.kernel_size - 1, k_raw.shape[0])
+            # unapply rope
+            self.k_buffer[l] = k_raw_nope[-buffer_size:].contiguous()
+
             self.k_raw[l] = k_raw
             self.v_raw[l] = v_raw
             self.cmp_k[l] = cmp_k
@@ -507,48 +520,55 @@ class NSATargetModel:
             st = self._stash_kv_new[l]
             if st is None:
                 raise RuntimeError("commit_after_verify: missing stashed KV; verify() did not run?")
-            k_new_rope, v_new = st
-            
+            k_new_rope, k_new, v_new = st
+
             # 只取有效的部分(commit_len个token)
-            kn = k_new_rope[:commit_len].contiguous().to(dtype)
-            vn = v_new[:commit_len].contiguous().to(dtype)
-            
+            k_new_rope = k_new_rope[:commit_len].contiguous().to(dtype)
+            k_new = k_new[:commit_len].contiguous().to(dtype)
+            v_new = v_new[:commit_len].contiguous().to(dtype)
+
             # 【准备增量压缩的context】
             # 用缓存末尾的kernel_size-1个KV作为context，确保压缩的连续性
             prev_raw_len = self.k_raw[l].shape[0]
             buffer_size = min(nsa.kernel_size - 1, prev_raw_len)
-            init_buf_k = self.k_raw[l][-buffer_size:] if buffer_size > 0 else None
-            init_buf_v = self.v_raw[l][-buffer_size:] if buffer_size > 0 else None
+            if buffer_size > 0:
+                v_buffer = self.v_raw[l][-buffer_size:]
+                k_buffer = self.k_buffer[l]
+                assert buffer_size <= k_buffer.shape[0]
+            else:
+                k_buffer = v_buffer = None
 
             # 【增量压缩】针对新KV apply incremental compression
             # _linear_compress_decode利用缓存context进行压缩
             decode_k = _linear_compress_decode(
-                kn,
+                k_new,
                 nsa.fsa.compress_key,
                 nsa.kernel_size,
                 nsa.kernel_stride,
                 nsa.fsa.intra_block_pe,
                 prev_raw_len,  # 告诉算子缓存的当前长度
-                init_buf_k,    # context KV
+                k_buffer,    # context KV
             )
             decode_v = _linear_compress_decode(
-                vn,
+                v_new,
                 nsa.fsa.compress_value,
                 nsa.kernel_size,
                 nsa.kernel_stride,
                 None,
                 prev_raw_len,
-                init_buf_v,
+                v_buffer,
             )
-            
+
             # 【追加压缩缓存】
             if decode_k is not None:
-                self.cmp_k[l] = torch.cat([self.cmp_k[l], decode_k], dim=0)
-                self.cmp_v[l] = torch.cat([self.cmp_v[l], decode_v], dim=0)
+                self.cmp_k[l] = torch.cat([self.cmp_k[l], decode_k], dim=0) if self.cmp_k[l] is not None else decode_k
+                self.cmp_v[l] = torch.cat([self.cmp_v[l], decode_v], dim=0) if self.cmp_v[l] is not None else decode_v
 
             # 【追加原始缓存】
-            self.k_raw[l] = torch.cat([self.k_raw[l], kn], dim=0)
-            self.v_raw[l] = torch.cat([self.v_raw[l], vn], dim=0)
+            self.k_raw[l] = torch.cat([self.k_raw[l], k_new_rope], dim=0) if self.k_raw[l] is not None else k_new_rope
+            self.v_raw[l] = torch.cat([self.v_raw[l], v_new], dim=0) if self.v_raw[l] is not None else v_new
+            self.k_buffer[l] = torch.cat([self.k_buffer[l], k_new], dim=0) if self.k_buffer[l] is not None else k_new
+            self.k_buffer[l] = self.k_buffer[l][-buffer_size:]
         
         # 【更新缓存长度】
         self.past_len += commit_len
@@ -611,6 +631,7 @@ class NSATargetModel:
             out = nsa(
                 hidden_flat,
                 target.k_raw[_lid],      # 历史原始K缓存
+                target.k_buffer[_lid],
                 target.v_raw[_lid],      # 历史原始V缓存
                 target.cmp_k[_lid],      # 历史压缩K缓存
                 target.cmp_v[_lid],      # 历史压缩V缓存
@@ -623,12 +644,12 @@ class NSATargetModel:
             # 5. 提取新的KV投影(k_new_rope已带RoPE, v_new是原始值)
             if len(stash) != 1:
                 raise RuntimeError(
-                    f"kv_commit_stash expected 1 tuple, got {len(stash)} (position_ids must be set)"
+                    f"kv_commit_stash expected 1 tuple, got {len(stash)}"
                 )
-            kn, vn = stash[0]
+            k_new_rope, k_new, v_new = stash[0]
             # 保存这些新KV，供后续commit_after_verify使用
-            target._stash_kv_new[_lid] = (kn.detach(), vn.detach())
-            
+            target._stash_kv_new[_lid] = (k_new_rope.detach(), k_new.detach(), v_new.detach())
+
             # 6. 返回格式转换：NSA返回[n, hidden_size]，需要转为[batch=1, n, hidden_size]和两个None(缓存)
             return (out.unsqueeze(0), None, None)
 
@@ -669,7 +690,7 @@ class NSATargetModel:
         
         cumulative长度张量表示："当前batch的起始=0，结束=end"
         用于告诉压缩算子和稀疏注意力"处理多少个token"
-        
+
         参数：
         - device: 张量所在的设备
         - end: cumulative长度的终点值

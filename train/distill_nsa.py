@@ -259,10 +259,9 @@ class NSATrainLayer(nn.Module):
             hidden_flat,
             cu_seqlens.to(torch.int32),
             cu_seqlens.to(torch.int32),
-            empty, empty, empty, empty,
+            empty, empty, empty, empty, empty,
             attention_mask=None,
             position_ids=position_ids_flat,
-            use_dedup=False,
         )
 
     def trainable_params(self):

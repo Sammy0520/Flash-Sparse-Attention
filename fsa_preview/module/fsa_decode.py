@@ -67,13 +67,13 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         x: torch.Tensor,  # shape: [total_len, hidden_size]
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,  # shape: [batch_size + 1]
-        k_cache: torch.Tensor = None,
+        k_cache: torch.Tensor = None, # k_cache that stores rope(k)
+        k_buffer: torch.Tensor = None, # k_buffer that stores min(self.kernel_size - 1, prev_raw_len) k
         v_cache: torch.Tensor = None,
         cmp_k_cache: torch.Tensor = None,
         cmp_v_cache: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
         position_ids: torch.Tensor = None,
-        use_dedup: bool = False,
         kv_commit_stash: list = None,
     ):
         """
@@ -87,7 +87,6 @@ class FlashSparseAttentionDecode(torch.nn.Module):
                 For linear multi-token decode, typically `arange(past_len, past_len + q_len)`.
             use_dedup: Reserved for duplicate-KV dedup kernel; currently ignored.
         """
-        _ = use_dedup  # TODO: wire to topk/compressed path when kernel is ready
         # dtype and shape check
         assert x.dtype == torch.bfloat16 or x.dtype == torch.float16
         assert x.shape[-1] == self.hidden_size
@@ -96,20 +95,28 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
 
         # qkv proj
-        q = self.proj_q(x).view(-1, self.num_q_heads, self.head_dim)
+        q = self.proj_q(x).view(-1, self.num_q_heads, self.head_dim) # [total_q_len, num_q_heads, head_dim]
         k_new = self.proj_k(x).view(-1, self.num_kv_heads, self.head_dim)
         v_new = self.proj_v(x).view(-1, self.num_kv_heads, self.head_dim)
-        k = torch.cat([k_cache, k_new], dim=0)
-        v = torch.cat([v_cache, v_new], dim=0)
 
+        # apply rope to q and k_new
+        total_q_len = q.shape[0]
         if position_ids is not None:
-            # explicit absolute positions for the new queries/keys; only linear (single-batch) supported here
-            assert position_ids.shape[0] == q.shape[0], (
+            assert position_ids.shape[0] == total_q_len, (
                 f"position_ids length {position_ids.shape[0]} != total_q_len {q.shape[0]}"
             )
+            q = self.rope(q, cu_seqlens_q, position_ids=position_ids)
+            k_new_rope: torch.Tensor = self.rope(k_new, cu_seqlens_q, position_ids=position_ids)
+        else:
+            # TODO: This is incorrect for multiple batches. `start` parameter should be batched as well.
+            q = self.rope(q, cu_seqlens_q, start=total_k_len - total_q_len)
+            k_new_rope: torch.Tensor = self.rope(k_new, cu_seqlens_q, start=total_k_len - total_q_len)
+
+        k = torch.cat([k_cache, k_new_rope], dim=0) # full roped k
+        v = torch.cat([v_cache, v_new], dim=0)
+        total_k_len = k.shape[0]
 
         if attention_mask is not None:
-            total_q_len, total_k_len = q.shape[0], k.shape[0]
             assert attention_mask.dim() in (2, 3), "attention_mask must be 2D or 3D"
             if attention_mask.dim() == 2:
                 assert attention_mask.shape == (total_q_len, total_k_len), (
@@ -136,13 +143,11 @@ class FlashSparseAttentionDecode(torch.nn.Module):
         ).to(torch.int32)
 
         # compressed key and value before rope
-        # _linear_compress_decode 使用「未压缩」序列坐标：prev_total_len 为追加 k_new 前的原始 KV
-        # 长度；token_buffer 为边界重叠窗口，须为 **原始** K/V 尾部。误用 cmp_* 长度或已压缩向量
-        # 会导致窗口索引错误或对已压缩特征再次 linear_compress（长上下文下偏差放大）。
         prev_raw_len = k_cache.shape[0]
         buffer_size = min(self.kernel_size - 1, prev_raw_len)
-        initial_buffer_k = k_cache[-buffer_size:] if buffer_size > 0 else None
-        initial_buffer_v = v_cache[-buffer_size:] if buffer_size > 0 else None
+        if k_buffer is not None:
+            assert buffer_size <= k_buffer.shape[0]
+        v_buffer = v_cache[-buffer_size:] if buffer_size > 0 else None
 
         # Decode the last part
         decode_k_output = _linear_compress_decode(
@@ -152,7 +157,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             self.kernel_stride,
             self.intra_block_pe,
             prev_raw_len,
-            initial_buffer_k,
+            k_buffer,
         )
 
         decode_v_output = _linear_compress_decode(
@@ -162,8 +167,9 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             self.kernel_stride,
             None,
             prev_raw_len,
-            initial_buffer_v,
+            v_buffer,
         )
+
         # Combine results
         if decode_k_output is not None:
             compressed_k = torch.cat([cmp_k_cache, decode_k_output], dim=0)
@@ -189,12 +195,10 @@ class FlashSparseAttentionDecode(torch.nn.Module):
                 compressed_mask[:, c] = mask_2d[:, start:end].to(torch.float32).amax(dim=1)
             attention_mask_compressed = compressed_mask
 
-        # do rope for query and compressed key
-        if position_ids is not None:
-            q = self.rope(q, cu_seqlens_q, position_ids=position_ids)
-        else:
-            q = self.rope(q, cu_seqlens_q)
+        # do rope for compressed key
         # compressed_k uses compressed_cu_seqlens + (start,stride) scheme as before
+        # TODO: Make cmp_k_cache store rope(compressed_k)
+        # TODO: Support position_ids???
         compressed_k = self.rope(compressed_k, compressed_cu_seqlens, start=0, stride=self.kernel_stride)
 
         # attention between query and compressed key value
@@ -218,17 +222,13 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             attention_mask=attention_mask_compressed,
         )
 
-        # do rope for original key
-        if position_ids is not None:
-            # apply RoPE only to new keys with explicit positions, keep cached part as-is
-            new_pos = position_ids
-            k_new_rope = self.rope(k_new, cu_seqlens_q, position_ids=new_pos)
-            k = torch.cat([k_cache, k_new_rope], dim=0)
-            if kv_commit_stash is not None:
-                # Same tensors used in attention; for SD commit append [:commit_len] to k_raw/v_raw.
-                kv_commit_stash.append((k_new_rope.detach(), v_new.detach()))
-        else:
-            k = self.rope(k, cu_seqlens_k)
+        if kv_commit_stash is not None:
+            kv_commit_stash.append((
+                k_new_rope.detach(), # rope(k_new) will be appended to k_cache
+                k_new.detach(), # k_new will be appended to k_buffer
+                v_new.detach(), # v_new will be appended to v_cache
+                # TODO: try to stash compressed_k and compressed_v to avoid extra _linear_compress_decode
+            ))
 
         # compute gate
         gate = self.gate(x)
