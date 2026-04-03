@@ -399,7 +399,7 @@ class NSATargetModel:
         # 【优化】复用cu张量，避免重复分配
         self._cu_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
-    def init_from_prefill(self, past_key_values):
+    def init_from_prefill(self, past_key_values, k_nope_storage = None):
         """
         【初始化缓存】从预填充(prefill)阶段的密集KV缓存初始化NSA缓存
         
@@ -430,12 +430,18 @@ class NSATargetModel:
             cu_k = torch.tensor([0, k_raw.shape[0]], device=device, dtype=torch.int32)
             
             # 【压缩】对原始KV进行压缩
-            position_ids = torch.arange(0, k_raw.shape[0], device=k_raw.device)
-            k_raw_nope = nsa.fsa.rope(
-                k_raw,
-                cu_k,
-                position_ids=-position_ids,
-            )
+            if k_nope_storage is None:
+                position_ids = torch.arange(0, k_raw.shape[0], device=k_raw.device)
+                k_raw_nope = nsa.fsa.rope(
+                    k_raw,
+                    cu_k,
+                    position_ids=-position_ids,
+                )
+            else:
+                k_raw_nope = k_nope_storage[l]
+                seq_len = k_raw_nope.shape[1]
+                k_raw_nope = k_raw_nope.view(seq_len, nsa.fsa.num_kv_heads, nsa.fsa.head_dim)
+
             cmp_k, cmp_v = nsa.build_compressed_cache(k_raw_nope, v_raw, cu_k)
 
             # 【保存】存储原始和压缩缓存
@@ -1100,21 +1106,36 @@ class NSASDRunner(DenseSDRunner):
         device = input_ids.device
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+
+        k_nope_storage = {}
+        hook_handles = []
+
+        def get_hook(layer_idx):
+            def hook(module, input, output):
+                k_nope_storage[layer_idx] = output.detach().clone()
+            
+            return hook
         
+        for i in range(self.target.config.num_hidden_layers):
+            target_submodule = self.target.model.layers[i].self_attn.k_proj
+            handle = target_submodule.register_forward_hook(get_hook(i))
+            hook_handles.append(handle)
+
         # ========== 预填充阶段 ==========
         # 【目标模型预填充】用密集注意力处理初始prompt
-        t_prefill = self.target(input_ids, use_cache=True, num_logits_to_keep=1)
+        try:
+            t_prefill = self.target(input_ids, use_cache=True, num_logits_to_keep=1)
+            prefill_target_kv = t_prefill.past_key_values
+            self.nsa_target.init_from_prefill(prefill_target_kv, k_nope_storage)
+        finally:
+            for h in hook_handles:
+                h.remove()
         
         # 【草稿模型预填充】用草稿模型也处理同样的prompt
         d_prefill = self.draft(input_ids, use_cache=True, num_logits_to_keep=1)
         
         # 【采样首个token】从目标模型的预填充输出采样
         cur = sample_from_logits(t_prefill.logits[:, -1, :], self.temperature, self._vocab)
-        
-        # 【初始化NSA缓存】关键步骤：将密集HF缓存转换为NSA格式
-        # 这只在整个生成过程中做一次，之后的解码循环全部用NSA
-        prefill_target_kv = t_prefill.past_key_values
-        self.nsa_target.init_from_prefill(prefill_target_kv)
         
         # 【草稿模型缓存】继续用标准缓存
         draft_cache = d_prefill.past_key_values
