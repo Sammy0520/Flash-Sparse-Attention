@@ -220,6 +220,7 @@ class FlashSparseAttentionDecode(torch.nn.Module):
             self.local_blocks,
             query_start_index=k_cache.shape[0],
             attention_mask=attention_mask_compressed,
+            max_seqlen_k_original=seqlens_k.max().item(),
         )
 
         if kv_commit_stash is not None:

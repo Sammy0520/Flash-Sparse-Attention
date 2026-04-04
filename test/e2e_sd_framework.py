@@ -438,8 +438,18 @@ class NSATargetModel:
                 )
             else:
                 k_raw_nope = k_nope_storage[l]
-                seq_len = k_raw_nope.shape[1]
-                k_raw_nope = k_raw_nope.view(seq_len, nsa.fsa.num_kv_heads, nsa.fsa.head_dim)
+                # 兼容两种格式:
+                #   - 旧格式 (from HF hook): [1, seq_len, num_kv_heads * head_dim]
+                #   - 新格式 (from NSA prefill): [seq_len, num_kv_heads, head_dim]
+                if k_raw_nope.dim() == 2:
+                    # 旧格式: [1, seq_len, nkv*hd] -> 先去 batch -> [seq_len, nkv*hd]
+                    seq_len = k_raw_nope.shape[0]
+                    k_raw_nope = k_raw_nope.view(seq_len, nsa.fsa.num_kv_heads, nsa.fsa.head_dim)
+                elif k_raw_nope.dim() == 3 and k_raw_nope.shape[0] == 1:
+                    # 旧格式 with batch dim: [1, seq_len, nkv*hd]
+                    seq_len = k_raw_nope.shape[1]
+                    k_raw_nope = k_raw_nope.view(seq_len, nsa.fsa.num_kv_heads, nsa.fsa.head_dim)
+                # else: 已经是 [seq_len, num_kv_heads, head_dim]，无需变换
 
             cmp_k, cmp_v = nsa.build_compressed_cache(k_raw_nope, v_raw, cu_k)
 
@@ -759,9 +769,16 @@ class NSATargetModel:
         
         # 【开启验证模式】标记Hook应该使用NSA而不是标准注意力
         self._verify_mode = True
-        
+
         # 【前向传播】Llama模型的标准前向，但所有注意力被Hook替换为NSA
-        out = self.llama(verify_ids, use_cache=False, num_logits_to_keep=n)
+        # 传入正确的 position_ids，确保模型内部生成的 causal mask 和
+        # position_embeddings 与真实位置一致（即使 NSA hook 自行计算 RoPE）。
+        out = self.llama(
+            verify_ids,
+            position_ids=self._pos_ids.unsqueeze(0),
+            use_cache=False,
+            num_logits_to_keep=n,
+        )
         
         # 【关闭验证模式】恢复正常
         self._verify_mode = False
@@ -1024,7 +1041,19 @@ class NSASDRunner(DenseSDRunner):
                 ckpt = torch.load(ckpt_path, map_location="cpu")
             nsa_sd = ckpt["nsa"]  # 提取NSA权重字典
             for l_key, sd in nsa_sd.items():
-                self.nsa_layers[int(l_key)].fsa.load_state_dict(sd, strict=True)
+                self.nsa_layers[int(l_key)].fsa.load_state_dict(sd, strict=False)
+
+            # 【关键修复】checkpoint 的 load_state_dict 可能覆盖了 proj_q/k/v/o 权重。
+            # 预填充阶段使用原始 Llama 的投影权重生成 KV 缓存，
+            # 验证阶段的 NSA 模块也必须使用相同的投影权重，否则 Q/K 空间不匹配。
+            # 因此在加载 checkpoint 后，强制从 Llama 原始注意力层复制投影权重。
+            with torch.no_grad():
+                for l_idx, nsa in enumerate(self.nsa_layers):
+                    llama_attn = target_model.model.layers[l_idx].self_attn
+                    nsa.fsa.proj_q.weight.copy_(llama_attn.q_proj.weight)
+                    nsa.fsa.proj_k.weight.copy_(llama_attn.k_proj.weight)
+                    nsa.fsa.proj_v.weight.copy_(llama_attn.v_proj.weight)
+                    nsa.fsa.proj_o.weight.copy_(llama_attn.o_proj.weight)
         else:
             # 没有检查点时，用均值池初始化(相当于对所有KV求均值)
             self._init_mean_pool()
@@ -1075,6 +1104,85 @@ class NSASDRunner(DenseSDRunner):
                 nsa.fsa.gate[0].weight[0].fill_(-1e-2)  # 第一行用小负值初始化
                 nsa.fsa.gate[0].weight[2].fill_(-1e-2)  # 第三行用小负值初始化
 
+    def _nsa_prefill(self, input_ids: torch.Tensor):
+        """
+        【NSA 预填充】使用 FlashSparseAttentionDecode 替换所有层的注意力进行预填充。
+        与 --real-fsa 训练路径完全一致（空缓存 + 完整序列），确保 hidden states
+        经过 FSA decode 注意力处理，消除 train-test 分布偏差。
+
+        返回:
+        - out: 预填充输出 (包含 logits)
+        - past_key_values: HF 格式的 KV 缓存
+        - k_nope_storage: 各层非 RoPE 的 K 投影（用于初始化 NSA 缓存压缩）
+        """
+        device = input_ids.device
+        dtype = next(self.target.parameters()).dtype
+
+        orig_forwards = {}
+        k_nope_storage = {}
+        past_key_values_list = []
+
+        for l, layer in enumerate(self.target.model.layers):
+            orig_forwards[l] = layer.self_attn.forward
+            fsa_layer = self.nsa_layers[l]
+
+            def make_hook(_lid, _fsa_layer):
+                def fsa_prefill_forward(hidden_states=None, *args, **kwargs):
+                    bsz, seq_len, hsz = hidden_states.shape
+                    hidden_flat = hidden_states.reshape(-1, hsz)
+                    total_len = hidden_flat.shape[0]
+
+                    cu_seqlens = torch.arange(
+                        0, (bsz + 1) * seq_len, seq_len,
+                        device=hidden_flat.device, dtype=torch.int32,
+                    )
+                    position_ids_flat = (
+                        torch.arange(seq_len, device=hidden_flat.device, dtype=torch.long)
+                        .unsqueeze(0).expand(bsz, -1).reshape(-1)
+                    )
+
+                    # 与 --real-fsa 训练路径完全一致：空缓存 + FlashSparseAttentionDecode
+                    fsa = _fsa_layer.fsa
+                    empty = torch.empty(
+                        0, fsa.num_kv_heads, fsa.head_dim,
+                        device=hidden_flat.device, dtype=hidden_flat.dtype,
+                    )
+                    stash = []
+                    attn_out = fsa(
+                        hidden_flat,
+                        cu_seqlens, cu_seqlens,
+                        empty, empty, empty, empty, empty,
+                        attention_mask=None,
+                        position_ids=position_ids_flat,
+                        kv_commit_stash=stash,
+                    )
+
+                    # 从 stash 提取 K(rope), K(nope), V
+                    k_rope_new, k_nope_new, v_new = stash[0]
+                    k_nope_storage[_lid] = k_nope_new.detach()
+
+                    # 构建 HF 格式缓存: [batch, num_heads, seq_len, head_dim]
+                    # k_rope_new: [total_len, num_kv_heads, head_dim]
+                    # 需要按 batch 拆分再 permute
+                    k_hf = k_rope_new.view(bsz, seq_len, fsa.num_kv_heads, fsa.head_dim)
+                    k_hf = k_hf.permute(0, 2, 1, 3).contiguous()
+                    v_hf = v_new.view(bsz, seq_len, fsa.num_kv_heads, fsa.head_dim)
+                    v_hf = v_hf.permute(0, 2, 1, 3).contiguous()
+                    past_key_values_list.append((k_hf.detach(), v_hf.detach()))
+
+                    return (attn_out.reshape(bsz, seq_len, hsz), None, None)
+                return fsa_prefill_forward
+            layer.self_attn.forward = make_hook(l, fsa_layer)
+
+        try:
+            out = self.target(input_ids, use_cache=False, num_logits_to_keep=1)
+        finally:
+            for l, layer in enumerate(self.target.model.layers):
+                layer.self_attn.forward = orig_forwards[l]
+
+        past_key_values = tuple(past_key_values_list)
+        return out, past_key_values, k_nope_storage
+
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int):
         """
@@ -1106,35 +1214,17 @@ class NSASDRunner(DenseSDRunner):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        k_nope_storage = {}
-        hook_handles = []
-
-        def get_hook(layer_idx):
-            def hook(module, input, output):
-                k_nope_storage[layer_idx] = output.detach().clone()
-            
-            return hook
-        
-        for i in range(self.target.config.num_hidden_layers):
-            target_submodule = self.target.model.layers[i].self_attn.k_proj
-            handle = target_submodule.register_forward_hook(get_hook(i))
-            hook_handles.append(handle)
-
         # ========== 预填充阶段 ==========
-        # 【目标模型预填充】用密集注意力处理初始prompt
-        try:
-            t_prefill = self.target(input_ids, use_cache=True, num_logits_to_keep=1)
-            prefill_target_kv = t_prefill.past_key_values
-            self.nsa_target.init_from_prefill(prefill_target_kv, k_nope_storage)
-        finally:
-            for h in hook_handles:
-                h.remove()
+        # 【NSA 预填充】使用 NSA 注意力（而非 dense 注意力）进行预填充，
+        # 确保 KV 缓存中的 hidden states 与训练时分布一致。
+        t_prefill_out, prefill_target_kv, k_nope_storage = self._nsa_prefill(input_ids)
+        self.nsa_target.init_from_prefill(prefill_target_kv, k_nope_storage)
         
         # 【草稿模型预填充】用草稿模型也处理同样的prompt
         d_prefill = self.draft(input_ids, use_cache=True, num_logits_to_keep=1)
         
         # 【采样首个token】从目标模型的预填充输出采样
-        cur = sample_from_logits(t_prefill.logits[:, -1, :], self.temperature, self._vocab)
+        cur = sample_from_logits(t_prefill_out.logits[:, -1, :], self.temperature, self._vocab)
         
         # 【草稿模型缓存】继续用标准缓存
         draft_cache = d_prefill.past_key_values
@@ -1214,6 +1304,15 @@ class NSASDRunner(DenseSDRunner):
                             f"  {name}: max={t.max().item():.4f}  std={t.std().item():.4f}  "
                             f"mean={t.mean().item():.4f}  shape={tuple(t.shape)}"
                         )
+                    # Per-position top-1 comparison
+                    print("  Per-position argmax comparison:")
+                    for pos in range(min(n + 1, dense_logits_dbg.shape[0], target_logits.shape[0])):
+                        d_top = dense_logits_dbg[pos].argmax().item()
+                        n_top = target_logits[pos].argmax().item()
+                        match = "✓" if d_top == n_top else "✗"
+                        d_tok = self.tokenizer.decode([d_top])
+                        n_tok = self.tokenizer.decode([n_top])
+                        print(f"    pos {pos}: dense={d_top}({d_tok!r}) nsa={n_top}({n_tok!r}) {match}")
 
                 # 【logit缩放】可选的logit缩放用于补偿NSA和dense的尺度差异
                 if self.nsa_verify_logits_scale != 1.0:
@@ -1294,7 +1393,7 @@ def print_stats(name: str, stats: GenerationStats, text: str):
         print(f"  acceptance_rate       : {stats.acceptance_rate:.3f}")
         print(f"  avg_accept_len        : {stats.avg_accept_len:.3f}")
         print(f"  num_rounds            : {stats.num_rounds}")
-    print(f"  text (prefix)         : {text[:512]!r}")
+    print(f"  text (prefix)         : {text!r}")
 
 
 def main():

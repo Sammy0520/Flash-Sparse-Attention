@@ -123,6 +123,7 @@ def _compressed_attention_decode(
     local_blocks: int = 2,
     query_start_index: int = 0,
     attention_mask: torch.Tensor = None,
+    max_seqlen_k_original: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Attention between query and compressed key and value. Compute attention output and topk block idx used in topk_sparse_attention.
 
@@ -210,6 +211,7 @@ def _compressed_attention_decode(
                 max_seqlen_k,
                 init_blocks,
                 local_blocks,
+                max_seqlen_k_original=max_seqlen_k_original,
             )
 
         # get topk
@@ -305,11 +307,17 @@ def transform_score_decode(
     max_seqlen_k: int,
     init_blocks: int = 1,
     local_blocks: int = 2,
+    max_seqlen_k_original: int = 0,
 ) -> torch.Tensor:
     num_k_heads, total_query_len, max_key_len = score.shape
     batch_size = cu_seqlens_q.shape[0] - 1
     pad_len = kernel_size // kernel_stride - 1
-    max_blocks = math.ceil(max_seqlen_k / block_size)
+    # max_blocks 必须在原始(未压缩)的 key 空间中计算，
+    # 否则 topk 选块会被错误地截断为极少数块。
+    if max_seqlen_k_original > 0:
+        max_blocks = math.ceil(max_seqlen_k_original / block_size)
+    else:
+        max_blocks = math.ceil(max_seqlen_k / block_size)
 
     block_score = torch.zeros(
         num_k_heads,
