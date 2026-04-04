@@ -48,6 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
+import math
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -549,6 +550,10 @@ def main():
     parser.add_argument("--kernel-stride", type=int, default=16)
     parser.add_argument("--init-blocks", type=int, default=1)
     parser.add_argument("--local-blocks", type=int, default=2)
+    parser.add_argument("--warmup-steps", type=int, default=200,
+                        help="线性 warmup 步数（从 0 升至 lr）")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05,
+                        help="余弦退火终止 lr = lr × min_lr_ratio")
     args = parser.parse_args()
 
     args.save_dir = (args.save_dir or "").strip()
@@ -663,8 +668,25 @@ def main():
                 flush=True,
             )
 
-    # ── 3. Optimizer ─────────────────────────────────────────────────
+    # ── 3. Optimizer + LR Scheduler ────────────────────────────────
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+
+    # 总 step 数（用于余弦退火）
+    tokens_per_step = args.batch * args.seqlen * args.grad_accum
+    total_steps = max(1, args.max_tokens // tokens_per_step)
+
+    def lr_lambda(current_step):
+        """Warmup + cosine annealing with min_lr."""
+        if current_step < args.warmup_steps:
+            # 线性 warmup: 0 → 1
+            return current_step / max(1, args.warmup_steps)
+        # 余弦退火: 1 → min_lr_ratio
+        progress = (current_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+        progress = min(progress, 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # 从 checkpoint 恢复（同一阶段断点续训）
     start_step = 0
@@ -675,7 +697,10 @@ def main():
             nsa_layers[l].fsa.load_state_dict(ckpt["nsa"][l])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"]
-        print(f"Resumed from step {start_step}")
+        # scheduler 快进到恢复位置
+        for _ in range(start_step):
+            scheduler.step()
+        print(f"Resumed from step {start_step}, lr={scheduler.get_last_lr()[0]:.2e}")
 
     # ── 4. Teacher hook（双 hook：同时捕获输入和输出）─────────────────
     capture = AttentionCapture()
@@ -715,7 +740,9 @@ def main():
     mode_s = "real-fsa (Triton decode)" if args.real_fsa else "proxy (flash_attn)"
     print(f"\nStart training [{mode_s}] (effective batch = {args.batch*args.grad_accum} "
           f"× {args.seqlen} = "
-          f"{args.batch*args.grad_accum*args.seqlen/1e3:.0f}K tokens/step)\n",
+          f"{args.batch*args.grad_accum*args.seqlen/1e3:.0f}K tokens/step)")
+    print(f"LR schedule: warmup {args.warmup_steps} steps → cosine decay to "
+          f"{args.lr * args.min_lr_ratio:.1e} over {total_steps} steps\n",
           flush=True)
 
     optimizer.zero_grad()
@@ -808,20 +835,23 @@ def main():
         if (microstep + 1) % args.grad_accum == 0:
             nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             step        += 1
             tokens_seen += args.batch * args.seqlen * args.grad_accum
+            cur_lr = scheduler.get_last_lr()[0]
 
             if step == 1:
                 elapsed = time.time() - t0
                 print(f"step={step:6d} | loss_sum={total_loss:.4f} (仅第1个optimizer步) | "
+                      f"lr={cur_lr:.2e} | "
                       f"tokens={tokens_seen/1e6:.1f}M | "
                       f"elapsed={elapsed/60:.1f}min", flush=True)
             if step % 10 == 0:
                 elapsed   = time.time() - t0
                 tok_per_s = (args.batch * args.seqlen * args.grad_accum * 10) / elapsed
                 print(f"step={step:6d} | loss={total_loss/10:.4f} | "
-                      f"tok/s={tok_per_s:.0f} | "
+                      f"lr={cur_lr:.2e} | tok/s={tok_per_s:.0f} | "
                       f"tokens={tokens_seen/1e6:.1f}M / {args.max_tokens/1e6:.0f}M | "
                       f"elapsed={elapsed/3600:.2f}h", flush=True)
                 total_loss = 0.0
