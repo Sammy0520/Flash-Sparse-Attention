@@ -452,6 +452,7 @@ def logit_kl_last_k_positions(
     """
     对序列末尾 K 个 next-token 位置做 KL(student || teacher)。
     logits[:, t, :] 预测 input_ids[:, t+1]。
+    返回每个位置的平均 KL 散度。
     """
     S = student_logits.shape[1]
     if last_k <= 0 or last_k >= S:
@@ -462,7 +463,8 @@ def logit_kl_last_k_positions(
     T = float(temperature)
     log_p = F.log_softmax(sl / T, dim=-1)
     q = F.softmax(tl / T, dim=-1)
-    return F.kl_div(log_p, q, reduction="batchmean") * (T ** 2)
+    # batchmean 只除以 B，不除以 last_k，需要手动除以 last_k 得到每位置平均 KL
+    return F.kl_div(log_p, q, reduction="batchmean") * (T ** 2) / last_k
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -746,6 +748,9 @@ def main():
           flush=True)
 
     optimizer.zero_grad()
+    acc_mse = 0.0   # 累计每层平均 MSE
+    acc_kl  = 0.0   # 累计 KL loss（未乘 weight）
+    acc_n   = 0     # 累计 microstep 数
     t_loop = time.time()
     for microstep, batch_ids in enumerate(loader):
         if microstep == 0:
@@ -777,7 +782,7 @@ def main():
                   flush=True)
 
         # ── 每层 MSE：用 teacher hook，不重跑 LLaMA ──
-        loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for l in train_layers:
             attn_input  = capture.inputs.get(l)   # [B, S, H]，layernorm 之后
@@ -795,11 +800,13 @@ def main():
             else:
                 nsa_out = nsa_layers[l].forward_prefill(attn_input_flat, cu_seqlens)
 
-            loss = loss + F.mse_loss(nsa_out.float(), teacher_flat.float())
+            mse_loss = mse_loss + F.mse_loss(nsa_out.float(), teacher_flat.float())
 
-        loss = loss / (len(train_layers) * args.grad_accum)
+        mse_loss = mse_loss / len(train_layers)  # 每层平均 MSE
+        loss = mse_loss / args.grad_accum
 
         # ── Logit KL：整模替换 train_layers 的 self_attn → 再跑一遍 llama ──
+        kl_loss_val = 0.0
         if args.logit_kl_weight > 0:
             saved_forwards = {}
             for l in train_layers:
@@ -824,10 +831,14 @@ def main():
                 last_k=args.logit_kl_last_k,
                 temperature=args.logit_temperature,
             )
+            kl_loss_val = lk.item()
             loss = loss + (args.logit_kl_weight * lk) / args.grad_accum
 
         loss.backward()
-        total_loss += loss.item() * args.grad_accum
+        # 记录分项 loss（未经 grad_accum 缩放的原始值）
+        acc_mse += mse_loss.item()
+        acc_kl  += kl_loss_val
+        acc_n   += 1
         if microstep < args.grad_accum:
             print(f"[progress] microstep {microstep} backward done "
                   f"({time.time()-t_loop:.0f}s since loop start)", flush=True)
@@ -840,22 +851,30 @@ def main():
             step        += 1
             tokens_seen += args.batch * args.seqlen * args.grad_accum
             cur_lr = scheduler.get_last_lr()[0]
+            # 计算该 optimizer step 的平均 loss
+            avg_mse = acc_mse / max(acc_n, 1)
+            avg_kl  = acc_kl  / max(acc_n, 1)
 
             if step == 1:
                 elapsed = time.time() - t0
-                print(f"step={step:6d} | loss_sum={total_loss:.4f} (仅第1个optimizer步) | "
+                kl_s = f" kl={avg_kl:.4f}" if args.logit_kl_weight > 0 else ""
+                print(f"step={step:6d} | mse={avg_mse:.4f}{kl_s} | "
                       f"lr={cur_lr:.2e} | "
-                      f"tokens={tokens_seen/1e6:.1f}M | "
-                      f"elapsed={elapsed/60:.1f}min", flush=True)
+                      f"tokens={tokens_seen/1e6:.1f}M", flush=True)
             if step % 10 == 0:
                 elapsed   = time.time() - t0
                 tok_per_s = (args.batch * args.seqlen * args.grad_accum * 10) / elapsed
-                print(f"step={step:6d} | loss={total_loss/10:.4f} | "
+                remaining_tokens = max(0, args.max_tokens - tokens_seen)
+                eta_min = (remaining_tokens / tok_per_s / 60) if tok_per_s > 0 else float('inf')
+                kl_s = f" kl={avg_kl:.4f}" if args.logit_kl_weight > 0 else ""
+                print(f"step={step:6d} | mse={avg_mse:.4f}{kl_s} | "
                       f"lr={cur_lr:.2e} | tok/s={tok_per_s:.0f} | "
                       f"tokens={tokens_seen/1e6:.1f}M / {args.max_tokens/1e6:.0f}M | "
-                      f"elapsed={elapsed/3600:.2f}h", flush=True)
-                total_loss = 0.0
-                t0         = time.time()
+                      f"ETA {eta_min:.0f}min", flush=True)
+                acc_mse = 0.0
+                acc_kl  = 0.0
+                acc_n   = 0
+                t0      = time.time()
 
             if step % args.save_steps == 0:
                 ckpt_path = os.path.join(args.save_dir, f"step_{step:06d}")

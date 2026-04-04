@@ -1,0 +1,18 @@
+python train/distill_nsa.py \
+    --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
+    --real-fsa \
+    --seqlen 512 \
+    --batch 2 \
+    --grad-accum 4 \
+    --lr 3.5141919e-3 \
+    --warmup-steps 54 \
+    --min-lr-ratio 0.03114514 \
+    --logit-kl-weight 1.5 \
+    --logit-kl-last-k 128 \
+    --logit-temperature 2.0 \
+    --max-tokens 9114514 \
+    --save-steps 1024 \
+    --save-dir /root/autodl-tmp/nsa_ckpt_tinystories \
+    --layers all \
+    --topk 16 \
+    --local-data /root/autodl-tmp/tinystories_128M.pt
