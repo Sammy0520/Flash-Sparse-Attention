@@ -5,12 +5,12 @@ accelerate
 torch>=2.8.0
 triton>=3.4.0
 # FA v2 for general cases (bump from 2.6.3 to 2.8.3)
-pip install git+https://github.com/Dao-AILab/flash-attention.git
+git+https://github.com/Dao-AILab/flash-attention.git
 
 # FA v3 in hopper platform for general cases
-pip install git+https://github.com/Dao-AILab/flash-attention.git#subdirectory=hopper
+#pip install git+https://github.com/Dao-AILab/flash-attention.git#subdirectory=hopper
 
 # add cudnn
-pip install nvidia_cudnn_frontend
+nvidia_cudnn_frontend
 
 -r requirements-dev.txt

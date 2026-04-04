@@ -22,16 +22,17 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 
 LLAMA_SNAPSHOT = (
-    "/data1/models/Llama-3.1-8B-Instruct/snapshots"
-    "/0e9e39f249a16976918f6564b8830bc894c89659"
+    "/root/autodl-tmp/models/Llama-3.1-8B-Instruct"
+    # "/data1/models/Llama-3.1-8B-Instruct/snapshots"
+    # "/0e9e39f249a16976918f6564b8830bc894c89659"
 )
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model-path", default=LLAMA_SNAPSHOT)
-    p.add_argument("--out", default="/data1/zzy/c4_500M.pt")
-    p.add_argument("--target-tokens", type=int, default=500_000_000)
+    p.add_argument("--out", default="/root/autodl-tmp/c4_200M.pt")
+    p.add_argument("--target-tokens", type=int, default=200_000_000)
     p.add_argument("--log-every-samples", type=int, default=500)
     p.add_argument("--dataset", default="allenai/c4")
     p.add_argument("--config", default="en")

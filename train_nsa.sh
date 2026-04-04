@@ -1,17 +1,16 @@
 python train/distill_nsa.py   \
-    --model /data1/models/Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659 \
+    --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
     --real-fsa   \
-    --seqlen 2048   \
+    --seqlen 1024   \
     --batch 1   \
-    --grad-accum 4   \
+    --grad-accum 2   \
     --lr 2.0919810114514e-5    \
     --logit-kl-weight 0.5   \
     --logit-kl-last-k 8   \
     --logit-temperature 2.0   \
-    --max-tokens 11144514   \
-    --save-steps 200   \
-    --save-dir /data1/sn/nsa_ckpt_seqlen_2048   \
+    --max-tokens 5114514   \
+    --save-steps 1024   \
+    --save-dir /root/autodl-tmp/nsa_ckpt  \
     --layers all   \
-    --topk 64   \
-    --local-data /data1/zzy/c4_500M.pt
-
+    --topk 16  \
+    --local-data /root/autodl-tmp/c4_200M.pt
