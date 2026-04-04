@@ -744,8 +744,8 @@ def main():
           f"× {args.seqlen} = "
           f"{args.batch*args.grad_accum*args.seqlen/1e3:.0f}K tokens/step)")
     print(f"LR schedule: warmup {args.warmup_steps} steps → cosine decay to "
-          f"{args.lr * args.min_lr_ratio:.1e} over {total_steps} steps\n",
-          flush=True)
+          f"{args.lr * args.min_lr_ratio:.1e} over {total_steps} steps")
+    print(f"Total steps: {total_steps}\n", flush=True)
 
     optimizer.zero_grad()
     acc_mse = 0.0   # 累计每层平均 MSE
@@ -858,16 +858,16 @@ def main():
             if step == 1:
                 elapsed = time.time() - t0
                 kl_s = f" kl={avg_kl:.4f}" if args.logit_kl_weight > 0 else ""
-                print(f"step={step:6d} | mse={avg_mse:.4f}{kl_s} | "
+                print(f"step={step:6d}/{total_steps} | mse={avg_mse:.4f}{kl_s} | "
                       f"lr={cur_lr:.2e} | "
                       f"tokens={tokens_seen/1e6:.1f}M", flush=True)
-            if step % 10 == 0:
+            if step % 4 == 0:
                 elapsed   = time.time() - t0
-                tok_per_s = (args.batch * args.seqlen * args.grad_accum * 10) / elapsed
+                tok_per_s = (args.batch * args.seqlen * args.grad_accum * 4) / elapsed
                 remaining_tokens = max(0, args.max_tokens - tokens_seen)
                 eta_min = (remaining_tokens / tok_per_s / 60) if tok_per_s > 0 else float('inf')
                 kl_s = f" kl={avg_kl:.4f}" if args.logit_kl_weight > 0 else ""
-                print(f"step={step:6d} | mse={avg_mse:.4f}{kl_s} | "
+                print(f"step={step:6d}/{total_steps} | mse={avg_mse:.4f}{kl_s} | "
                       f"lr={cur_lr:.2e} | tok/s={tok_per_s:.0f} | "
                       f"tokens={tokens_seen/1e6:.1f}M / {args.max_tokens/1e6:.0f}M | "
                       f"ETA {eta_min:.0f}min", flush=True)

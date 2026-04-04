@@ -14,6 +14,7 @@ The script follows docs/e2e.md as closely as possible for:
 """
 
 import argparse
+from html import parser
 import os
 import random
 import sys
@@ -1393,7 +1394,7 @@ def print_stats(name: str, stats: GenerationStats, text: str):
         print(f"  acceptance_rate       : {stats.acceptance_rate:.3f}")
         print(f"  avg_accept_len        : {stats.avg_accept_len:.3f}")
         print(f"  num_rounds            : {stats.num_rounds}")
-    print(f"  text (prefix)         : {text[:512]!r}")
+    print(f"  text (prefix)         : {text[:1024]!r}")
 
 
 def main():
@@ -1428,15 +1429,82 @@ def main():
         "--prompt",
         type=str,
         default=(
-            "Once upon a time, there was a little girl named Amy. She lived in a normal house with her mom and dad. "
-            "Every day, Amy would wake up early in the morning and go outside to play with her friends. "
-            "They had a special network of friends who always played together and helped each other. "
-            "One day, Amy saw a new kid in the neighborhood who was all alone. "
-            "She went to the new kid and asked, 'Do you want to play with us?' "
-            "The new kid smiled and said, 'Yes, please!' So, Amy took the new kid to her network of friends "
-            "and introduced him. They all played together and had lots of fun. "
-            "As the days went by, Amy and her friends learned that when they included everyone, "
-            "they had even more fun. "
+            "very little to eat on the table, but Mrs. Wire gave him the poorest "
+            "there was--a hard crust of brown bread, a cold potato, and a dish of "
+            "warm water with a very little molasses and milk in it, which he was "
+            "expected to imagine was tea. "
+            "Harry felt no disposition to eat. He was too sad and depressed, and "
+            "probably if the very best had been set before him he would have been "
+            "equally indifferent. "
+            "After supper Harry assisted Jacob about the barn, and it was nearly "
+            "eight o'clock before they finished. "
+            "\"Now, boy, it is about bed time, and I will show you your rooms, if "
+            "you like,\" said Jacob. \"Before you go, let me tell you it won't do any "
+            "good to try to run away from here, for I am going to borrow Leman's "
+            "bull-dog.\" "
+            "Harry made no reply to this remark, and followed his master to the low "
+            "attic of the house, where he was pointed to a rickety bedstead, which "
+            "he was to occupy. "
+            "But Harry was determined not to go to bed in the dark; so, as soon as "
+            "he heard Jacob's step on the floor below, he crept to the stairway, "
+            "and silently descended. He had made up his mind not to wait for the "
+            "bull-dog. Pausing in the entry, he heard Jacob tell his wife that he "
+            "was going over to Leman's to borrow his dog; he was afraid the boy "
+            "would get up in the night and set his barn on fire, or run away. "
+            "After allowing time enough to elapse for Jacob to reach Leman's house, "
+            "he softly opened the front door and went out. It was quite dark, and "
+            "after he had got a short distance from the house, he felt a reasonable "
+            "degree of security. "
+            "His first purpose was to get as far away from Redfield as possible "
+            "before daylight should come to betray him; and, taking the road, he "
+            "walked as fast as his legs would carry him towards Boston. "
+            "The moral lesson he had learned was of infinitely more value than even "
+            "the lesson of policy. For the first time in his life he was conscious "
+            "of a deep and earnest desire to be a good boy, and to become a true "
+            "man. As he walked along, he thought more of being a good man than of "
+            "being a rich man. "
+            "He heard a clock strike eleven. It was not the Redfield clock, and it "
+            "was evident that he was approaching Rockville, a factory village eight "
+            "miles from his native place. But his legs were failing him. He was "
+            "exhausted by the labors and the excitement of the day and night. "
+            "Seating himself on a rock by the side of the road, he decided to hold "
+            "a council of war, to determine what should be done. It was hardly safe "
+            "for him to go through the village by night or day, after the search "
+            "which had been made for Ben Smart. "
+            "He had scarcely entered upon the consideration of this side of the "
+            "question before his quick ear detected the sound of rattling wheels in "
+            "the direction from which he had come. His heart beat violently. "
+            "Leaping over the stone wall by the side of the road, he secured the "
+            "only retreat which the vicinity afforded, and waited, with his heart "
+            "in his throat, for the coming of his pursuers. "
+            "\"Ur-r--woo!\" said a big bull-dog, placing his ugly nose against the "
+            "wall, behind which Harry was lying. "
+            "\"The dog has scented him,\" said another--that of Jacob Wire. "
+            "\"At him, Tiger!\" In obedience to this command, Tiger drew back a few "
+            "steps, and then leaped upon the top of the wall. Grasping two large "
+            "stones, he stood erect as the dog leaped on the wall. Inspired by the "
+            "imminence of his peril, he hurled one of the stones at Tiger the "
+            "instant he showed his ugly visage above the fence. The missile took "
+            "effect upon the animal, and Tiger was vanquished, and fell back from "
+            "the wall, howling with rage and pain. "
+            "Harry did not wait any longer, but took to his heels, followed by both "
+            "pursuers. He had not run far, however, before he realized that George "
+            "Leman was more than a match for him. Dodging round a large rock in the "
+            "field, he redoubled his efforts, running now towards the road where "
+            "the horse was standing. "
+            "Harry reached the road and leaped the wall at a single bound. The "
+            "horse was startled by the noise, and his snort suggested a brilliant "
+            "idea to Harry. \"Go 'long!\" he shouted; and the horse started towards "
+            "Rockville at a round pace. Harry jumped into the wagon over the hind "
+            "board, and grasping the reins, put the high-mettled animal to the top "
+            "of his speed. "
+            "\"Stop! Stop!\" shouted George Leman, astounded at the new phase which "
+            "the chase had assumed. \"Stop! and I will let you go.\" "
+            "Harry did not deem it prudent to stop, and in a few moments had left "
+            "his pursuers out of sight. He had played a desperate game, and won the "
+            "victory; yet he did not feel like indulging in a triumph. The battle "
+            "had been a bitter necessity, and he even regretted the fate of poor "
+            "Tiger, whose ribs he had stove in with a rock. "
         ),
     )
     args = parser.parse_args()
