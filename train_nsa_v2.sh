@@ -12,9 +12,8 @@
 # 预估显存: LLaMA bf16 ~16GB + NSA 参数+Adam ~2GB + 激活 ~12GB ≈ 30GB
 # 预估总 steps: 12207, 预估耗时: ~8-12h（取决于 real-fsa 速度）
 
-python train/distill_nsa.py \
+python train/distill_nsa_v2.py \
     --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
-    --real-fsa \
     --seqlen 1024 \
     --batch 2 \
     --grad-accum 4 \

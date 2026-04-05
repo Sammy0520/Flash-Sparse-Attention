@@ -1,6 +1,5 @@
-python train/distill_nsa.py \
+python train/distill_nsa_v2.py \
     --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
-    --real-fsa \
     --seqlen 2048 \
     --batch 1 \
     --grad-accum 8 \

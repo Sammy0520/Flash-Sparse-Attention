@@ -18,9 +18,8 @@
 #   --logit-kl-last-k 32  比 TinyStories 的 128 小，减少 seqlen=4096 下的 KL 开销
 #   --save-steps 64   每 64 步保存一次，方便中途监控（~5个检查点）
 
-python train/distill_nsa.py \
+python train/distill_nsa_v2.py \
     --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
-    --real-fsa \
     --seqlen 2048 \
     --batch 1 \
     --grad-accum 8 \
