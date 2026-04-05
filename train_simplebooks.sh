@@ -1,0 +1,19 @@
+python train/distill_nsa.py \
+    --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
+    --real-fsa \
+    --seqlen 2048 \
+    --batch 1 \
+    --grad-accum 8 \
+    --lr 2.21451419e-4 \
+    --warmup-steps 64 \
+    --min-lr-ratio 0.031419198 \
+    --logit-kl-weight 3.5 \
+    --logit-kl-last-k 1024 \
+    --logit-temperature 1.414 \
+    --max-tokens 8814514 \
+    --save-steps 2000 \
+    --save-dir /root/autodl-tmp/nsa_ckpt_simplebooks \
+    --init-ckpt /root/autodl-tmp/nsa_ckpt_pg19/final \
+    --layers all \
+    --topk 16 \
+    --local-data /root/autodl-tmp/simplebooks_94M.pt

@@ -37,6 +37,7 @@ logit 蒸馏（拉近 dense 与 NSA 的 verify logits）：
 
 import argparse
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -752,6 +753,15 @@ def main():
     acc_kl  = 0.0   # 累计 KL loss（未乘 weight）
     acc_n   = 0     # 累计 microstep 数
     t_loop = time.time()
+    _interrupted = False
+
+    def _sigint_handler(sig, frame):
+        nonlocal _interrupted
+        print("\nCtrl-C received, will save after current step ...", flush=True)
+        _interrupted = True
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     for microstep, batch_ids in enumerate(loader):
         if microstep == 0:
             print("[progress] microstep 0: loading batch → GPU ...", flush=True)
@@ -898,6 +908,8 @@ def main():
                 print(f"  Saved checkpoint: {ckpt_path}")
 
             if tokens_seen >= args.max_tokens:
+                break
+            if _interrupted:
                 break
 
     # 最终保存
