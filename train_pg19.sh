@@ -22,17 +22,17 @@ python train/distill_nsa_v2.py \
     --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
     --seqlen 2048 \
     --batch 1 \
-    --grad-accum 8 \
-    --lr 2.114514e-4 \
-    --warmup-steps 32 \
-    --min-lr-ratio 0.051419198 \
-    --logit-kl-weight 1.5 \
-    --logit-kl-last-k 32 \
+    --grad-accum 1 \
+    --lr 1.11451419e-5 \
+    --warmup-steps 4 \
+    --min-lr-ratio 0.081419198 \
+    --logit-kl-weight 2.0 \
+    --logit-kl-last-k 256 \
     --logit-temperature 2.0 \
-    --max-tokens 35114514 \
-    --save-steps 2000 \
+    --max-tokens 2114514 \
+    --save-steps 114514 \
     --save-dir /root/autodl-tmp/nsa_ckpt_pg19 \
-    --init-ckpt /root/autodl-tmp/nsa_ckpt_tinystories_phase2/final \
+    --init-ckpt /root/autodl-tmp/nsa_ckpt_pg19/final \
     --layers all \
     --topk 16 \
     --local-data /root/autodl-tmp/pg19_100M.pt

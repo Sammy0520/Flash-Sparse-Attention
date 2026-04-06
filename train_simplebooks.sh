@@ -1,18 +1,18 @@
 python train/distill_nsa_v2.py \
     --model /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
-    --seqlen 2048 \
+    --seqlen 1024 \
     --batch 1 \
-    --grad-accum 8 \
-    --lr 2.21451419e-4 \
-    --warmup-steps 64 \
-    --min-lr-ratio 0.031419198 \
-    --logit-kl-weight 3.5 \
-    --logit-kl-last-k 1024 \
-    --logit-temperature 1.414 \
-    --max-tokens 8814514 \
-    --save-steps 2000 \
+    --grad-accum 1 \
+    --lr 1.001451419e-5 \
+    --warmup-steps 4 \
+    --min-lr-ratio 0.08114514 \
+    --logit-kl-weight 3.0 \
+    --logit-kl-last-k 512 \
+    --logit-temperature 1.6 \
+    --max-tokens 2114514 \
+    --save-steps 114514 \
     --save-dir /root/autodl-tmp/nsa_ckpt_simplebooks \
-    --init-ckpt /root/autodl-tmp/nsa_ckpt_pg19/final \
+    --init-ckpt /root/autodl-tmp/nsa_ckpt_simplebooks/final \
     --layers all \
     --topk 16 \
     --local-data /root/autodl-tmp/simplebooks_94M.pt

@@ -38,6 +38,7 @@ logit 蒸馏（拉近 dense 与稀疏注意力的 verify logits）：
 
 import argparse
 import os
+from random import random
 import signal
 import sys
 import time
@@ -183,8 +184,7 @@ class SyntheticTokenDataset(IterableDataset):
 
 
 class LocalTokenDataset(IterableDataset):
-    """从本地 .pt 文件（1D token tensor）读取，按 seqlen 分块，循环使用。"""
-
+    """从本地 .pt 文件（1D token tensor）读取，按 seqlen 随机采样，循环使用。"""
     def __init__(self, path, seqlen=2048, max_tokens=None):
         try:
             self.data = torch.load(path, map_location="cpu", weights_only=True)
@@ -198,12 +198,9 @@ class LocalTokenDataset(IterableDataset):
     def __iter__(self):
         n     = len(self.data)
         total = 0
-        i     = 0
         while total < self.max_tokens:
-            if i + self.seqlen > n:
-                i = 0   # 循环
+            i = torch.randint(0, n - self.seqlen, (1,)).item()
             yield self.data[i:i + self.seqlen].long()
-            i     += self.seqlen
             total += self.seqlen
 
 

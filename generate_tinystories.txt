@@ -1,0 +1,23 @@
+Loading LLaMA from /root/autodl-tmp/models/Llama-3.1-8B-Instruct ...
+  32 layers, hidden=4096, vocab=128256
+Building NSA layers (FlashSparseAttentionDecode) ...
+Loading NSA checkpoint from /root/nsa_ckpt_tinystories/final/ckpt.pt ...
+  Checkpoint loaded: 32 layers, step=383, mode=NSA
+  Hparams: {'topk': 16, 'block_size': 64, 'window_size': 512, 'kernel_size': 32, 'kernel_stride': 16, 'init_blocks': 1, 'local_blocks': 2}
+
+Prompt (64 tokens): "Once there was a boy named Jack. He was three years old and he loved playing with his friends. One day, he was walking in the park when he saw a glove on the ground. He picked it up and asked himself, " Whose glove is this? " He looked around but there was no one..."
+Generating 128 tokens (temp=0.75, top_p=0.9) ...
+
+  Prefill: 64 tokens in 1.01s (64 tok/s)
+  Decode: 128/128 tokens (9.8 tok/s)
+
+============================================================
+Generated text (128 tokens):
+============================================================
+ in sight. He decided to take the glove home and ask his mother if she knew whose it was. When he arrived home, he put the glove in a special box where he kept lost things. He then went to his mother and said, " Mom, I found a glove in the park and I don't know whose it is. Can you help me find the owner? " His mother smiled and said, " Well, let's try to find the owner. " She took the glove and went to the park with Jack. They walked around and asked people if they had lost a glove. But no one seemed to know whose
+============================================================
+
+Stats:
+  Prefill:  64 tok in 1.01s (64 tok/s)
+  Decode:   128 tok in 13.10s (9.8 tok/s)
+  Total:    14.11s

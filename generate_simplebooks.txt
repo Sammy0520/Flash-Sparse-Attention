@@ -1,0 +1,40 @@
+Loading LLaMA from /root/autodl-tmp/models/Llama-3.1-8B-Instruct ...
+  32 layers, hidden=4096, vocab=128256
+Building NSA layers (FlashSparseAttentionDecode) ...
+Loading NSA checkpoint from /root/autodl-tmp/nsa_ckpt_simplebooks/final/ckpt.pt ...
+  Checkpoint loaded: 32 layers, step=405, mode=NSA
+  Hparams: {'topk': 16, 'block_size': 64, 'window_size': 512, 'kernel_size': 32, 'kernel_stride': 16, 'init_blocks': 1, 'local_blocks': 2}
+
+Prompt (128 tokens): "Sammy's Flying Machine
+
+I
+
+Sammy Red Squirrel was sitting on the stone wall eating a nut. " Caw, caw! " called Blacky Crow, as he flew over the field. " Caw, caw, caw! " he called. " What are you doing, Sammy? " Sammy stopped eating the nut, and looked up to see who was talking to him. He saw Blacky Crow sailing round and round over his head. " I am eating my breakfast, " he answered. " Would you like to have a nut to eat, too? " " Oh, no,..."
+Generating 768 tokens (temp=0.75, top_p=0.9) ...
+
+  Prefill: 128 tokens in 1.03s (125 tok/s)
+  Decode: 128/768 tokens (10.2 tok/s)
+  Decode: 256/768 tokens (10.2 tok/s)
+  Decode: 384/768 tokens (10.1 tok/s)
+  Decode: 512/768 tokens (10.1 tok/s)
+  Decode: 640/768 tokens (10.1 tok/s)
+  Decode: 768/768 tokens (10.1 tok/s)
+
+============================================================
+Generated text (768 tokens):
+============================================================
+ thank you, " said Blacky. " I am too busy. I have to go and get a drink. I am thirsty. " " Where are you going? " asked Sammy. " I am going to the pond. It is very hot today. " " I'm going to build a flying machine, " said Sammy. " Oh, really? " said Blacky. " What makes you think you can build a flying machine? " " Because I have been watching the birds flying, " said Sammy. " And I have been thinking about how they fly. I think I can make a machine that will fly, too. " " You are crazy! " said Blacky. " You will never make a flying machine! " " We'll see, " said Sammy.
+
+II
+
+Sammy went back to his home and started to build his flying machine. He gathered sticks and leaves and some old rags and started to tie them together. He made a long, thin stick and tied a piece of string around one end. He tied another piece of string around the other end. He tied some sticks together and made a sort of frame. He covered the frame with some leaves and old rags. " It looks like a big bird, " said Sammy. " But it is a machine, " he said. " I am going to call it the Red Squirrel's Flying Machine. " Blacky flew over Sammy's house and saw the strange machine. He laughed and said, " Ha ha, ha! You will never fly with that! " Sammy did not say anything, he just looked up at Blacky and smiled.
+
+III
+
+The sun was shining brightly, and the air was warm. Sammy put on a pair of goggles and climbed into his flying machine. He tied a piece of string around his waist, and sat down on the seat. He looked up at Blacky, who was still laughing. " Good luck, Sammy! " he said. " I will be watching you from the ground. " Sammy took a deep breath, and pushed off with his feet. The machine began to move, and Sammy started to run. He ran and ran, and the machine started to lift off the ground. It was a little wobbly at first, but Sammy held on tight and kept running. The machine was going up and up, and Sammy was flying! He was really flying! Sammy looked down and saw Blacky standing on the ground, his beak open in amazement. " Wow! " he said. " You are flying! " Sammy flew over the field, feeling the wind in his fur. He was so happy. He flew and flew, until he landed safely back on the ground. " That was wonderful! " he said to himself. " I did it! " Sammy took off his goggles and looked up at Blacky, who was still standing on the ground. " You said I would never fly, Blacky! " he said. " But I did! " Blacky looked up at Sammy and smiled. " Congratulations, Sammy! You are a true inventor! " Sammy smiled back at Blacky. " Thanks, Blacky. I'm glad you were here to see it. " " I'm glad I was here to see it, too, Sammy. " Sammy put away his flying machine and started to take it apart. He knew he would build another one, and fly again soon. Blacky flew over and said, " Hey, Sammy! What are you going to call your next flying machine? " " I'm not sure yet, " said Sammy. " But I think I will call it the Red Squirrel's Flying Machine Number Two. " Blacky laughed and said, " That '
+============================================================
+
+Stats:
+  Prefill:  128 tok in 1.03s (125 tok/s)
+  Decode:   768 tok in 75.86s (10.1 tok/s)
+  Total:    76.88s
