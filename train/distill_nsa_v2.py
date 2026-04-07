@@ -38,7 +38,6 @@ logit 蒸馏（拉近 dense 与稀疏注意力的 verify logits）：
 
 import argparse
 import os
-from random import random
 import signal
 import sys
 import time
@@ -69,13 +68,14 @@ LLAMA_PATH = ("/data1/models/Llama-3.1-8B-Instruct/snapshots"
 class SparseAttnTrainLayer(nn.Module):
     """
     稀疏注意力训练层，用于与 LLaMA dense attention 对齐。
-    q/k/v/o 权重从 LLaMA 复制且冻结；compress_key/value/gate 参与训练。
+    q/k/v/o 默认从 LLaMA 复制并冻结；若 freeze_qkvo=False 则 proj_q/k/v/o 可训练。
     直接调用 FlashSparseAttention / NativeSparseAttention 的 forward(x, cu_seqlens)。
     """
 
     def __init__(self, llama_attn, cfg, use_fsa=False,
                  topk=16, block_size=64, kernel_size=32, kernel_stride=16,
-                 init_blocks=1, local_blocks=2, window_size=512):
+                 init_blocks=1, local_blocks=2, window_size=512,
+                 freeze_qkvo=True):
         super().__init__()
         num_q  = cfg.num_attention_heads
         num_kv = cfg.num_key_value_heads
@@ -104,7 +104,7 @@ class SparseAttnTrainLayer(nn.Module):
             window_size=window_size, rope_config=rope_cfg,
         )
 
-        # q/k/v/o 权重复制并冻结
+        # q/k/v/o：从 LLaMA 复制初始化；是否冻结由 freeze_qkvo 控制
         with torch.no_grad():
             self.fsa.proj_q.weight.copy_(llama_attn.q_proj.weight)
             self.fsa.proj_k.weight.copy_(llama_attn.k_proj.weight)
@@ -113,7 +113,7 @@ class SparseAttnTrainLayer(nn.Module):
         for proj in [self.fsa.proj_q, self.fsa.proj_k,
                      self.fsa.proj_v, self.fsa.proj_o]:
             for param in proj.parameters():
-                param.requires_grad_(False)
+                param.requires_grad_(not freeze_qkvo)
 
         self.kernel_size   = kernel_size
         self.kernel_stride = kernel_stride
@@ -392,11 +392,30 @@ def main():
     parser.add_argument("--kernel-stride", type=int, default=16)
     parser.add_argument("--init-blocks",   type=int, default=1)
     parser.add_argument("--local-blocks",  type=int, default=2)
+    parser.add_argument(
+        "--train-qkvo",
+        action="store_true",
+        help="不冻结 q/k/v/o 线性层，与 compress/gate 等一起训练（显存与可训练参数量显著增加）",
+    )
+    parser.add_argument(
+        "--force-logit-kl-with-qkvo",
+        action="store_true",
+        help="与 --train-qkvo 同时使用时仍计算 logit KL（极耗显存，易 OOM/segfault；默认会跳过 KL，仅训 MSE）",
+    )
     parser.add_argument("--warmup-steps",  type=int, default=200,
                         help="线性 warmup 步数（从 0 升至 lr）")
     parser.add_argument("--min-lr-ratio",  type=float, default=0.05,
                         help="余弦退火终止 lr = lr x min_lr_ratio")
     args = parser.parse_args()
+
+    # --train-qkvo 时整模 logit KL 会再建一条「32 层 NSA × 全 LLaMA」的巨大反传图，极易 OOM/segfault；默认关闭 KL。
+    if args.train_qkvo and args.logit_kl_weight > 0 and not args.force_logit_kl_with_qkvo:
+        print(
+            "*** train-qkvo: 禁用 logit KL（仅 MSE）。若需 KL 请加 --force-logit-kl-with-qkvo，"
+            "或去掉 --train-qkvo。***",
+            flush=True,
+        )
+        args.logit_kl_weight = 0.0
 
     args.save_dir = (args.save_dir or "").strip()
     if not args.save_dir:
@@ -428,7 +447,8 @@ def main():
         train_layers = list(range(num_layers))
     else:
         train_layers = [int(x) for x in args.layers.split(",")]
-    print(f"Training {attn_mode} compress/gate for layers: {train_layers}")
+    qkvo_note = "qkvo+sparse" if args.train_qkvo else "compress/gate only"
+    print(f"Training {attn_mode} ({qkvo_note}) for layers: {train_layers}")
 
     sparse_layers = {}
     for l in train_layers:
@@ -443,6 +463,7 @@ def main():
             init_blocks=args.init_blocks,
             local_blocks=args.local_blocks,
             window_size=args.window_size,
+            freeze_qkvo=not args.train_qkvo,
         ).to(device, dtype)
         init_meanpool(sparse_layers[l])
     print(
@@ -621,8 +642,10 @@ def main():
                   f"forward + backward ...", flush=True)
 
         # ── 每层 MSE：用 teacher hook，不重跑 LLaMA ──
-        mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-
+        # 按层分别 backward，避免 32 层 NSA 在同一张图中同时反传（峰值显存过大，易 OOM / segfault）。
+        n_mse_layers = len(train_layers)
+        scale_mse = 1.0 / (n_mse_layers * args.grad_accum)
+        mse_sum = 0.0
         for l in train_layers:
             attn_input  = capture.inputs.get(l)   # [B, S, H]，layernorm 之后
             teacher_out = capture.outputs.get(l)  # [B, S, H]，self_attn 输出
@@ -630,18 +653,37 @@ def main():
             if attn_input is None or teacher_out is None:
                 continue
 
+            if microstep == 0 and l == train_layers[0]:
+                print("  [mse] layer 0 forward ...", flush=True)
+
             attn_input_flat = attn_input.reshape(-1, cfg.hidden_size)
             teacher_flat    = teacher_out.reshape(-1, cfg.hidden_size).detach()
 
             nsa_out = sparse_layers[l](attn_input_flat, cu_seqlens)
-            mse_loss = mse_loss + F.mse_loss(nsa_out.float(), teacher_flat.float())
+            mse_l = F.mse_loss(nsa_out.float(), teacher_flat.float())
+            mse_sum += float(mse_l.detach().item())
 
-        mse_loss = mse_loss / len(train_layers)  # 每层平均 MSE
-        loss = mse_loss / args.grad_accum
+            if microstep == 0 and l == train_layers[0]:
+                print("  [mse] layer 0 backward ...", flush=True)
+            (mse_l * scale_mse).backward()
+            if microstep == 0 and l == train_layers[0]:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print("  [mse] layer 0 backward OK", flush=True)
+
+        mse_loss_avg = mse_sum / max(n_mse_layers, 1)
+        if microstep == 0:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print("  [mse] all layers backward OK", flush=True)
 
         # ── Logit KL：整模替换 train_layers 的 self_attn -> 再跑一遍 llama ──
         kl_loss_val = 0.0
         if args.logit_kl_weight > 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if microstep == 0:
+                print("  [kl] student LLaMA forward (full graph) ...", flush=True)
             saved_forwards = {}
             for l in train_layers:
                 attn_mod = llama.model.layers[l].self_attn
@@ -665,11 +707,16 @@ def main():
                 temperature=args.logit_temperature,
             )
             kl_loss_val = lk.item()
-            loss = loss + (args.logit_kl_weight * lk) / args.grad_accum
+            if microstep == 0:
+                print("  [kl] backward ...", flush=True)
+            (args.logit_kl_weight * lk / args.grad_accum).backward()
+            if microstep == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print("  [kl] backward OK", flush=True)
 
-        loss.backward()
-        # 记录分项 loss（未经 grad_accum 缩放的原始值）
-        acc_mse += mse_loss.item()
+        # 记录分项 loss（未经 grad_accum 缩放的「每层平均 MSE」）
+        acc_mse += mse_loss_avg
         acc_kl  += kl_loss_val
         acc_n   += 1
         if microstep < args.grad_accum:
@@ -732,6 +779,7 @@ def _save_checkpoint(args, sparse_layers, optimizer, train_layers, step, name):
         "nsa": {l: sparse_layers[l].fsa.state_dict() for l in train_layers},
         "optimizer": optimizer.state_dict(),
         "train_layers": train_layers,
+        "train_qkvo": getattr(args, "train_qkvo", False),
         "attn_mode": "FSA" if args.fsa else "NSA",
         "nsa_hparams": {
             "topk": args.topk,

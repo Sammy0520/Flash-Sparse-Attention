@@ -2,8 +2,8 @@
 NSA Attention Distillation Training
 =====================================
 目标：用 LLaMA-3.1-8B 的 dense attention 输出作为 teacher，训练 NSA 的
-      compress_key / compress_value / intra_block_pe / gate 参数（共 ~256M）。
-      q/k/v/o 权重和 LLaMA 其他权重全程冻结。
+      compress_key / compress_value / intra_block_pe / gate 等参数。
+      默认 q/k/v/o 从 LLaMA 复制并冻结；可用 --train-qkvo 同时训练 q/k/v/o。LLaMA 其余权重全程冻结。
 
 Loss = 每层 MSE(NSA_attn_out, LLaMA_attn_out)，对所有层求和
       可选 + --logit-kl-weight × KL：整模 NSA 前向与 frozen LLaMA 的末尾 K 个 next-token logits 对齐
@@ -69,13 +69,14 @@ LLAMA_PATH = ("/data1/models/Llama-3.1-8B-Instruct/snapshots"
 class NSATrainLayer(nn.Module):
     """
     prefill 场景的 NSA 注意力层，用于与 LLaMA dense attention 对齐。
-    q/k/v/o 权重从 LLaMA 复制且冻结；compress_key/value/gate 参与训练。
+    q/k/v/o 默认从 LLaMA 复制并冻结；若 freeze_qkvo=False 则 proj_q/k/v/o 可训练。
     forward_prefill 使用 flash_attn 替换 decode Triton kernel。
     """
 
     def __init__(self, llama_attn, cfg,
                  topk=16, block_size=64, kernel_size=32, kernel_stride=16,
-                 init_blocks=1, local_blocks=2, window_size=512):
+                 init_blocks=1, local_blocks=2, window_size=512,
+                 freeze_qkvo=True):
         super().__init__()
         num_q  = cfg.num_attention_heads
         num_kv = cfg.num_key_value_heads
@@ -95,7 +96,7 @@ class NSATrainLayer(nn.Module):
             window_size=window_size, rope_config=rope_cfg,
         )
 
-        # q/k/v/o 权重复制并冻结
+        # q/k/v/o：从 LLaMA 复制初始化；是否冻结由 freeze_qkvo 控制
         with torch.no_grad():
             self.fsa.proj_q.weight.copy_(llama_attn.q_proj.weight)
             self.fsa.proj_k.weight.copy_(llama_attn.k_proj.weight)
@@ -106,7 +107,7 @@ class NSATrainLayer(nn.Module):
                   self.fsa.proj_v.parameters(),
                   self.fsa.proj_o.parameters()]:
             for param in p:
-                param.requires_grad_(False)
+                param.requires_grad_(not freeze_qkvo)
 
         self.kernel_size   = kernel_size
         self.kernel_stride = kernel_stride
@@ -553,6 +554,11 @@ def main():
     parser.add_argument("--kernel-stride", type=int, default=16)
     parser.add_argument("--init-blocks", type=int, default=1)
     parser.add_argument("--local-blocks", type=int, default=2)
+    parser.add_argument(
+        "--train-qkvo",
+        action="store_true",
+        help="不冻结 q/k/v/o 线性层，与 compress/gate 等一起训练（显存与可训练参数量显著增加）",
+    )
     parser.add_argument("--warmup-steps", type=int, default=200,
                         help="线性 warmup 步数（从 0 升至 lr）")
     parser.add_argument("--min-lr-ratio", type=float, default=0.05,
@@ -588,7 +594,8 @@ def main():
         train_layers = list(range(num_layers))
     else:
         train_layers = [int(x) for x in args.layers.split(",")]
-    print(f"Training NSA compress/gate for layers: {train_layers}")
+    qkvo_note = "qkvo+NSA" if args.train_qkvo else "compress/gate only"
+    print(f"Training NSA ({qkvo_note}) for layers: {train_layers}")
 
     nsa_layers = {}
     for l in train_layers:
@@ -602,6 +609,7 @@ def main():
             init_blocks=args.init_blocks,
             local_blocks=args.local_blocks,
             window_size=args.window_size,
+            freeze_qkvo=not args.train_qkvo,
         ).to(device, dtype)
         init_meanpool(nsa_layers[l])
     print(
@@ -894,6 +902,7 @@ def main():
                     "nsa": {l: nsa_layers[l].fsa.state_dict() for l in train_layers},
                     "optimizer": optimizer.state_dict(),
                     "train_layers": train_layers,
+                    "train_qkvo": getattr(args, "train_qkvo", False),
                     "real_fsa": args.real_fsa,
                     "nsa_hparams": {
                         "topk": args.topk,
@@ -920,6 +929,7 @@ def main():
         "nsa": {l: nsa_layers[l].fsa.state_dict() for l in train_layers},
         "optimizer": optimizer.state_dict(),
         "train_layers": train_layers,
+        "train_qkvo": getattr(args, "train_qkvo", False),
         "real_fsa": args.real_fsa,
         "nsa_hparams": {
             "topk": args.topk,

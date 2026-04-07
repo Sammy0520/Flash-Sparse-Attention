@@ -11,6 +11,9 @@ NSA / FSA Autoregressive Generation Test
      从 logits 采样，commit 新 KV 到压缩缓存
   4. 打印生成文本 + 速度指标
 
+加载 ckpt 后默认使用 checkpoint 内的 proj_q/k/v/o；若蒸馏使用了 --train-qkvo，请勿再加
+--force-llama-proj。须与训练一致的 --topk / --block-size / window / kernel 等。
+
 用法：
   python test/test_nsa_generate.py --nsa-ckpt checkpoints/nsa_distill/final
   python test/test_nsa_generate.py --nsa-ckpt checkpoints/nsa_distill/final \\
@@ -803,6 +806,12 @@ def main():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--greedy", action="store_true",
                         help="贪心解码（temperature=0）")
+    parser.add_argument(
+        "--force-llama-proj",
+        action="store_true",
+        help="加载 ckpt 后仍用冻结 LLaMA 的 q/k/v/o 覆盖 NSA 的 proj（旧行为；"
+             "若蒸馏时用了 --train-qkvo，请勿加此选项）",
+    )
     args = parser.parse_args()
 
     if args.greedy:
@@ -853,18 +862,25 @@ def main():
         nsa_sd = ckpt["nsa"]
         for l_key, sd in nsa_sd.items():
             nsa_layers[int(l_key)].fsa.load_state_dict(sd, strict=False)
-        # 强制从 LLaMA 重新复制 proj 权重（ckpt 中可能保存了旧的）
-        with torch.no_grad():
-            for l_idx, nsa in enumerate(nsa_layers):
-                la = llama.model.layers[l_idx].self_attn
-                nsa.fsa.proj_q.weight.copy_(la.q_proj.weight)
-                nsa.fsa.proj_k.weight.copy_(la.k_proj.weight)
-                nsa.fsa.proj_v.weight.copy_(la.v_proj.weight)
-                nsa.fsa.proj_o.weight.copy_(la.o_proj.weight)
+        # 默认：保留 ckpt 中的 proj_q/k/v/o（--train-qkvo 蒸馏得到的权重必须走此路径）。
+        # 仅当需要与旧脚本一致、强制对齐 frozen LLaMA 投影时再传 --force-llama-proj。
+        if args.force_llama_proj:
+            with torch.no_grad():
+                for l_idx, nsa in enumerate(nsa_layers):
+                    la = llama.model.layers[l_idx].self_attn
+                    nsa.fsa.proj_q.weight.copy_(la.q_proj.weight)
+                    nsa.fsa.proj_k.weight.copy_(la.k_proj.weight)
+                    nsa.fsa.proj_v.weight.copy_(la.v_proj.weight)
+                    nsa.fsa.proj_o.weight.copy_(la.o_proj.weight)
+            print("  proj: overwritten from frozen LLaMA (--force-llama-proj)")
+        else:
+            print("  proj: from checkpoint (not overwritten with LLaMA)")
         hparams = ckpt.get("nsa_hparams", {})
         attn_mode = ckpt.get("attn_mode", ckpt.get("real_fsa", "unknown"))
         print(f"  Checkpoint loaded: {len(nsa_sd)} layers, "
               f"step={ckpt.get('step', '?')}, mode={attn_mode}")
+        if "train_qkvo" in ckpt:
+            print(f"  train_qkvo (ckpt meta): {ckpt['train_qkvo']}")
         if hparams:
             print(f"  Hparams: {hparams}")
     else:
