@@ -1064,7 +1064,7 @@ def _topk_sparse_attention_bwd(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
         num_warps=num_warps,
-        num_stages=num_stages,
+        num_stages=2,
     )
     dk = dk.sum(0)
     dv = dv.sum(0)
